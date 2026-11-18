@@ -1,0 +1,264 @@
+class GrokkiAgent {
+  constructor(apiClient) {
+    this.api = apiClient || (typeof window !== 'undefined' ? window.jarvisAPI : null);
+    this.apiKey = '';
+  }
+
+  getApi() {
+    if (!this.api && typeof window !== 'undefined' && window.jarvisAPI) {
+      this.api = window.jarvisAPI;
+    }
+    return this.api;
+  }
+
+  setApiKey(key) {
+    this.apiKey = (key || '').trim();
+  }
+
+  timeout(promise, ms, label = 'Timed out') {
+    return Promise.race([
+      promise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error(label)), ms)),
+    ]);
+  }
+
+  async process(goal, context = {}) {
+    const api = this.getApi();
+    if (!api || typeof api.executeAI !== 'function') {
+      const local = await this.executeLocalFallback(goal);
+      if (local.handled) return local;
+      return {
+        reply: 'Grokki API connection is initializing. Please try again.',
+        actionsExecuted: [],
+      };
+    }
+
+    // 1. Prioritize Gemini AI Brain
+    let lastAiError = null;
+    try {
+      const aiRes = await this.timeout(api.executeAI(goal, context), 60000, 'Request timed out');
+      if (aiRes && aiRes.success) {
+        return {
+          reply: aiRes.reply || 'Done.',
+          actionsExecuted: aiRes.actionsExecuted || [],
+          grounding: aiRes.grounding || null,
+        };
+      }
+      if (aiRes && aiRes.error) {
+        lastAiError = aiRes.error;
+      }
+    } catch (err) {
+      console.warn('AI failed, checking local fallback:', err);
+      lastAiError = err.message;
+    }
+
+    // 2. Only use local fallback if AI is unavailable or fails
+    const local = await this.executeLocalFallback(goal);
+    if (local.handled) return local;
+
+    return {
+      reply: lastAiError ? `Error: ${lastAiError}` : 'Could not complete request. Try again.',
+      actionsExecuted: [],
+    };
+  }
+
+  async executeLocalFallback(goal) {
+    const api = this.getApi();
+    const text = (goal || '').trim();
+    const lower = text.toLowerCase();
+
+    if (/^(hi|hello|hey|yo)\b/i.test(lower)) {
+      return { handled: true, reply: 'Ready.', actionsExecuted: [] };
+    }
+
+    if (lower.includes('volume') || lower.includes('sound') || lower.includes('mute')) {
+      let action = 'get';
+      const match = lower.match(/(\d{1,3})\s*%?/);
+      if (match) {
+        action = 'set';
+        const level = Math.max(0, Math.min(100, Number(match[1])));
+        const res = api ? await api.systemControl({ action, level }) : {};
+        return { handled: true, reply: res.message || `Volume: ${level}%`, actionsExecuted: [{ type: 'system_control', action: 'volume_set' }] };
+      }
+      if (lower.includes('down')) action = 'down';
+      else if (lower.includes('up') || lower.includes('increase')) action = 'up';
+      else if (lower.includes('mute')) action = 'mute';
+      const res = api ? await api.systemControl({ action }) : {};
+      return { handled: true, reply: res.message || 'Volume updated.', actionsExecuted: [{ type: 'system_control', action }] };
+    }
+
+    if (lower.includes('code') || lower.includes('vs code') || lower.includes('vscode')) {
+      if (lower.includes('error') || lower.includes('problem') || lower.includes('bug')) {
+        try {
+          if (api) {
+            const aiRes = await this.timeout(api.executeAI('inspect VS Code errors'), 16000, 'VS Code scan busy');
+            if (aiRes && aiRes.success) return { handled: true, reply: aiRes.reply, actionsExecuted: aiRes.actionsExecuted || [] };
+          }
+        } catch (err) {
+          return { handled: true, reply: 'VS Code scan busy. Open Problems with Ctrl+Shift+M.', actionsExecuted: [] };
+        }
+      }
+      if (api) await api.openApp('code');
+      return { handled: true, reply: 'VS Code opened.', actionsExecuted: [{ type: 'open_app', appName: 'VS Code' }] };
+    }
+
+    if (lower.includes('word') || lower.includes('ms word') || lower.includes('microsoft word')) {
+      if (api) await api.openApp('winword');
+      return { handled: true, reply: 'Word opened.', actionsExecuted: [{ type: 'open_app', appName: 'Word' }] };
+    }
+
+    if (lower.includes('yt music') || lower.includes('youtube music') || (lower.includes('youtube') && lower.includes('music'))) {
+      const songMatch = text.match(/(?:play|listen to|search for)\s+(.+?)(?:\s+in|\s+on|\s+at)?\s*(?:yt music|youtube music)?$/i);
+      const song = songMatch ? songMatch[1].replace(/in yt music|on yt music/i, '').trim() : '';
+      const url = song ? `https://music.youtube.com/search?q=${encodeURIComponent(song)}` : 'https://music.youtube.com';
+      if (api) await api.openUrl(url);
+      return { handled: true, reply: `YouTube Music: ${song || 'opened'}.`, actionsExecuted: [{ type: 'open_url', url }] };
+    }
+
+    if (/^(connect|sign in|login|link|auth).*google/i.test(lower) || /google.*(connect|sign in|login|link|auth)/i.test(lower)) {
+      if (api && api.connectGoogle) {
+        api.connectGoogle();
+        return {
+          handled: true,
+          reply: 'Opened Google Sign-In in your default browser. Please select your account and grant permissions to connect Grokki!',
+          actionsExecuted: [{ type: 'connect_google' }],
+        };
+      }
+    }
+
+    if (/^(search\s+for|search\s+on\s+google|search|google\s+(?!doc|sheet|drive|classroom|task|contact|account|connect|calendar|mail|email))\b/i.test(lower)) {
+      let query = text.replace(/^(?:search\s+for|search\s+on\s+google|search|google)\s+/i, '').trim();
+      if (query) {
+        const url = lower.includes('youtube')
+          ? `https://www.youtube.com/results?search_query=${encodeURIComponent(query.replace(/youtube/i, '').trim())}`
+          : `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+        if (api) await api.openUrl(url);
+        return { handled: true, reply: `Opened search: ${query}.`, actionsExecuted: [{ type: 'open_url', url }] };
+      }
+    }
+
+    // Timer / Lock-In / Focus Session detection in fallback
+    if (
+      /\b(lock[- ]?in|pomodoro|study\s+session|focus\s+session|focus\s+timer|study\s+timer)\b/i.test(lower) ||
+      /\b(set|start|begin|create|run)\s+(a\s+|an\s+)?(\d+(\.\d+)?\s*[- ]?(min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours)\s+)?(timer|countdown|lock[- ]?in|pomodoro)\b/i.test(lower)
+    ) {
+      let mins = 25;
+      const minMatch = text.match(/(\d+(?:\.\d+)?)\s*[- ]?(?:min|mins|minute|minutes|m)\b/i);
+      const secMatch = text.match(/(\d+(?:\.\d+)?)\s*[- ]?(?:sec|secs|second|seconds|s)\b/i);
+      const hrMatch = text.match(/(\d+(?:\.\d+)?)\s*[- ]?(?:hr|hrs|hour|hours|h)\b/i);
+      if (minMatch) mins = parseFloat(minMatch[1]);
+      else if (secMatch) mins = Math.max(0.08, parseFloat(secMatch[1]) / 60);
+      else if (hrMatch) mins = parseFloat(hrMatch[1]) * 60;
+
+      const isPlainTimer = /\b(timer|countdown)\b/i.test(lower) && !/\b(lock[- ]?in|study|pomodoro|focus)\b/i.test(lower);
+      let subject = isPlainTimer ? 'Timer' : 'Study';
+      const subjMatch = text.match(/(?:on|for|studying)\s+([a-zA-Z0-9\s_+-]+)$/i);
+      if (subjMatch) {
+        const candidate = subjMatch[1].replace(/\b(\d+\s*(min|mins|minute|minutes|sec|seconds|m|s)|lock[- ]?in|session|timer|study)\b/gi, '').trim();
+        if (candidate) subject = candidate;
+      }
+      if (api && api.setIslandActivity) {
+        const totalSec = Math.max(1, Math.round(mins * 60));
+        api.setIslandActivity({
+          action: 'start',
+          kind: 'timer',
+          icon: 'fa-solid fa-stopwatch',
+          title: subject.toLowerCase() === 'timer' ? 'Timer' : `Lock-In • ${subject}`,
+          subject,
+          durationMinutes: mins,
+          durationSeconds: totalSec,
+          endTime: Date.now() + totalSec * 1000,
+        });
+      }
+      return {
+        handled: true,
+        reply: `⏱️ Lock-in study timer running for **${mins} minutes** on your **Mini Dynamic Island**!`,
+        actionsExecuted: [{ type: 'start_lock_in_study_session', duration_minutes: mins, subject }],
+      };
+    }
+
+    const launchMatch = text.match(/^(?:open|launch|start|run)\s+(.+)$/i);
+    if (launchMatch) {
+      const appName = launchMatch[1].trim();
+      const lowerApp = appName.toLowerCase();
+      const isTaskPhrase = /^(a|an|my|the|some|this)\s+/i.test(lowerApp) ||
+        /\b(session|lock[- ]?in|timer|pomodoro|countdown|alarm|reminder|minute|minutes|min|mins|second|seconds|hour|hours|study|recording|lecture|meeting|mode|quiz|viva)\b/i.test(lowerApp);
+      if (!isTaskPhrase && api && typeof api.openApp === 'function') {
+        await api.openApp(appName);
+        return { handled: true, reply: `${appName} opened.`, actionsExecuted: [{ type: 'open_app', appName }] };
+      }
+    }
+
+    return { handled: false, reply: '', actionsExecuted: [] };
+  }
+
+  async processAudio(audioBlob) {
+    const api = this.getApi();
+    if (!api || typeof api.executeAIAudio !== 'function') {
+      return {
+        reply: 'Audio bridge not ready. Please try typing.',
+        transcript: 'Voice command',
+        actionsExecuted: [],
+      };
+    }
+
+    const base64Audio = await new Promise((resolve) => {
+      const reader = new FileReader();
+      reader.onloadend = () => {
+        const resStr = String(reader.result || '');
+        const commaIdx = resStr.indexOf(',');
+        resolve(commaIdx !== -1 ? resStr.slice(commaIdx + 1) : '');
+      };
+      reader.onerror = () => resolve('');
+      reader.readAsDataURL(audioBlob);
+    });
+
+    try {
+      const res = await this.timeout(api.executeAIAudio({
+        base64Audio,
+        mimeType: audioBlob.type || 'audio/webm',
+      }), 22000, 'Voice AI timed out');
+
+      if (res && res.success) {
+        return {
+          reply: res.reply || 'Done.',
+          transcript: res.transcript || 'Voice command',
+          actionsExecuted: res.actionsExecuted || [],
+        };
+      }
+      if (res?.error === 'NO_SPEECH_DETECTED') {
+        return {
+          error: 'NO_SPEECH_DETECTED',
+          reply: '',
+          transcript: '',
+          actionsExecuted: [],
+        };
+      }
+      let errorReply = 'Voice processing failed. Try typing.';
+      if (res?.error === 'NO_API_KEY') {
+        errorReply = 'No API key configured.';
+      } else if (res?.error) {
+        errorReply = typeof res.error === 'string' ? res.error : 'Voice error.';
+      }
+      return {
+        reply: errorReply,
+        transcript: res?.transcript || 'Voice command',
+        actionsExecuted: [],
+      };
+    } catch (err) {
+      return {
+        reply: `${err.message || 'Voice failed'}. Try typing.`,
+        transcript: 'Voice command',
+        actionsExecuted: [],
+      };
+    }
+  }
+}
+
+if (typeof window !== 'undefined') {
+  window.GrokkiAgent = GrokkiAgent;
+  window.JarvisAgent = GrokkiAgent;
+}
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = GrokkiAgent;
+}

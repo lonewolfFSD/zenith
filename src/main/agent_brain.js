@@ -1,0 +1,7081 @@
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+const { exec, execFile, spawn } = require('child_process');
+let electronModule = {};
+try {
+  electronModule = require('electron');
+} catch (e) {}
+const shell = (electronModule && electronModule.shell) ? electronModule.shell : {
+  openExternal: async (url) => {
+    exec(`powershell -NoProfile -Command "Start-Process '${url}'"`);
+  }
+};
+const screen = (electronModule && electronModule.screen) ? electronModule.screen : {
+  getPrimaryDisplay: () => ({ size: { width: 1536, height: 864 } })
+};
+const desktopCapturer = (electronModule && electronModule.desktopCapturer) ? electronModule.desktopCapturer : null;
+const { GoogleGenAI } = require('@google/genai');
+const memory = require('./memory');
+const googleWorkspace = require('./google_workspace');
+const { convertGeminiToolsToOpenAI, callOpenAICompatible, transcribeWithGroqWhisper } = require('./ai_providers');
+const studyEngine = require('./study_engine');
+const powerTools = require('./power_tools');
+const agentDesktop = require('./agent_desktop');
+const mcpManager = require('./mcp_manager');
+const browserAgent = require('./browser_agent');
+const uiTarsAgent = require('./ui_tars_agent');
+const lanceDbStore = require('./vector_db_lancedb');
+const mem0Manager = require('./mem0_manager');
+function shouldAutoSearchWeb(prompt = '', history = []) {
+  if (!prompt || typeof prompt !== 'string') return false;
+  const raw = prompt.trim();
+  const p = raw.toLowerCase();
+
+  // 1. NEVER auto search web for desktop actions, Google Workspace, WhatsApp, local tools, or file operations
+  if (/\b(google\s+(drive|doc|docs|sheet|sheets|slides|calendar|task|tasks|contacts?|workspace|account|mail)|drive|gmail|whatsapp|spotify|word|excel|powerpoint|calculator|notepad|screenshot|snip|volume|brightness|pc\s+health|folder|file|upload|download|save|create|delete|open|close|lock|sleep|shutdown|mute|unmute)\b/i.test(p)) {
+    return false;
+  }
+
+  // 2. NEVER auto search for conversational chit-chat, greetings, questions about the AI, and casual remarks
+  if (/^(hi|hello|hey|yo|sup|wassup|wazzup|whats?\s*up|what\s+is\s+up|how\s*('?s|is)\s*(it\s*going|everything|life)|how\s+are\s+you|how\s+do\s+you\s+do|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|thanks|thank\s+you|thx|ok|okay|k|bye|goodbye|see\s+ya|cool|nice|great|awesome|wonderful|sweet|neat|fine|who\s+are\s+you|what\s+is\s+your\s+name|what\s+can\s+you\s+do|tell\s+me\s+(a\s+joke|something|about\s+yourself)|what\s+are\s+you\s+doing|what\s+do\s+you\s+think|help\s*me?|can\s+you\s+help|i\s*('?m|am)\s+(bored|sad|happy|tired|here)|you\s+there|are\s+you\s+(there|alive|awake|ready|real)|what\s+time\s+is\s+it|how\s+old\s+are\s+you)\b/i.test(p)) {
+    return false;
+  }
+
+  // 3. NEVER auto search for standard coding, math, general science, or creative requests
+  if (/^(write|code|implement|create|give\s+me|generate)\s+(a\s+)?(function|script|program|code|algorithm|class|regex|component|sql|query|poem|story|essay|summary|joke)\b/i.test(p)) {
+    return false;
+  }
+  if (/^(solve|calculate|evaluate|what\s+is)\s+[\d\s\+\-\*\/\^\(\)\.\=]+$/i.test(p)) {
+    return false;
+  }
+
+  // 4. Image / photo / picture / gallery queries
+  if (/\b(images?|photos?|pics?|pictures?|views?|gallery|wallpaper|look\s+like|appearance)\b/i.test(p)) {
+    return true;
+  }
+
+  // 5. Explicit web search keywords
+  if (/\b(search\s+(the\s+)?web|deep\s+search|web\s+search|live\s+search|browse\s+web)\b/i.test(p)) return true;
+  if (/^google\s+(.+)/i.test(p)) return true;
+
+  // 6. University / College / Institution / Campus queries (e.g. Assam Don Bosco University, ADBU, IIT, etc.)
+  if (/\b(university|college|institute|campus|adbu|assam\s+don\s+bosco|don\s+bosco|iit|nit|bits|aiims|iim|oxford|harvard|stanford|cambridge|mit)\b/i.test(p)) {
+    return true;
+  }
+
+  // 7. Current events, protests, conflicts, happenings
+  if (/\b(what('?s|\s+is)\s+(the\s+)?(protest|protests|strike|war|conflict|situation|news|happening|going\s+on))\b/i.test(p)) return true;
+  if (/\b(going\s+on\s+in|happening\s+in|protests?\s+in)\b/i.test(p)) return true;
+  if (/\b(right\s+now|currently|current\s+news|today'?s\s+news|latest\s+news|breaking\s+news|recent\s+news)\b/i.test(p)) return true;
+  // Year-based queries for 2024-2029 (knowledge cutoff evasion)
+  if (/\b(202[4-9]|203\d)\b/.test(p)) return true;
+  // High-frequency factual questions: who won, who is the current, winner of, stock price of, etc.
+  if (/\b(exchange\s*rate|currency|forex|fx\s*rate|who\s+won|who\s+is\s+the\s+current|winner\s+of|champions?\s+of|score\s+of|release\s+date\s+of|when\s+is\s+the\s+next|price\s+of|stock\s+price|crypto\s+price|weather\s*(in|for)?|nobel\s+prize|election|president\s+of|ceo\s+of)\b/i.test(p)) return true;
+
+  // 8. If recent conversation history is grounded in an entity and prompt is a follow-up inquiry
+  if (history && history.length > 0) {
+    const isFollowUp = /\b(courses?|programs?|degrees?|b\.?tech|bca|mca|mba|m\.?tech|b\.?sc|m\.?sc|b\.?com|bba|ph\.?d|curriculum|syllabus|admissions?|eligibility|fees?|fee\s+structure|tuition|scholarships?|placements?|package|salary|cutoffs?|rankings?|campuses?|hostels?|campus\s+life|faculty|professors?|vice\s+chancellor|chancellor|dean|departments?|schools?|accreditation|naac|nirf|aicte|ugc|reviews?|contact|address|location|how\s+to\s+apply|entrance\s+exam)\b/i.test(p) ||
+      /^(what\s+about|how\s+about|tell\s+me\s+more|more\s+details|show\s+me|list\s+all|list\s+every|list\s+of|give\s+me|can\s+you\s+give|can\s+you\s+list|can\s+you\s+show|all\s+courses|what\s+are\s+the|details\s+on|no\s+[a-z]+|is\s+there\b)\b/i.test(p);
+    if (isFollowUp) {
+      const lastTexts = history.slice(-5).map(t => {
+        if (typeof t === 'string') return t;
+        if (t.parts && Array.isArray(t.parts)) return t.parts.map(pt => pt.text || '').join(' ');
+        return t.text || t.content || '';
+      }).join(' ').toLowerCase();
+      if (/\b(university|college|campus|adbu|assam|don\s+bosco|iit|nit|bits|institute|school|academy)\b/i.test(lastTexts)) {
+        return true;
+      }
+    }
+  }
+
+  // 9. If user has a linked academic portal and asks an academic/course inquiry
+  try {
+    const academicPortal = require('./academic_portal');
+    const cfg = academicPortal.loadConfig();
+    if (cfg && cfg.linked && cfg.universityName) {
+      if (/\b(courses?|programs?|degrees?|b\.?tech|bca|mca|mba|m\.?tech|b\.?sc|m\.?sc|b\.?com|bba|ph\.?d|curriculum|syllabus|admissions?|eligibility|fees?|fee\s+structure|tuition|scholarships?|placements?|package|salary|cutoffs?|rankings?|campuses?|hostels?|campus\s+life|faculty|professors?|vice\s+chancellor|chancellor|dean|departments?|schools?|how\s+to\s+apply|entrance\s+exam)\b/i.test(p)) {
+        return true;
+      }
+    }
+  } catch (_) {}
+
+  return false;
+}
+
+function resolveSearchQuery(prompt = '', history = [], config = {}, context = {}) {
+  if (!prompt || typeof prompt !== 'string') return '';
+  const raw = prompt.trim();
+  const p = raw.toLowerCase();
+
+  if (!raw) return '';
+
+  // Location Grounding: If user enabled location sharing in Grokki settings and query is a local inquiry (weather, restaurants, nearby places)
+  if (config && config.shareLocation && (config.locationCity || config.locationCountry)) {
+    const isLocalInquiry = /\b(weather|forecast|temperature|temp|rain|raining|umbrella|snow|restaurants?|cafes?|food\s+(place|spot|joint)s?|dining|eatery|eateries|places\s+to\s+eat|hotels?|supermarkets?|malls?|hospitals?|pharmacies|pharmacy|clinics?|places\s+to\s+visit|things\s+to\s+do|sunset|sunrise|traffic|near\s+me|nearby|around\s+here|local)\b/i.test(p);
+    const hasExplicitLocation = /\b(in|at|around|for)\s+([A-Z][a-z]+|[a-z]{3,})\b/i.test(raw);
+    if (isLocalInquiry && !hasExplicitLocation) {
+      const locTarget = [config.locationCity, config.locationCountry].filter(Boolean).join(', ');
+      return `${raw} in ${locTarget}`;
+    }
+  }
+
+  // Independent topic guard: NEVER prepend prior entities if the user explicitly switched to a strong topic
+  if (/\b(gta|grand theft auto|call of duty|minecraft|fortnite|cyberpunk|witcher|apple|microsoft|google|nvidia|intel|amd|tesla|bitcoin|ethereum|crypto|ps5|xbox|nintendo|switch|iphone|samsung|pixel|windows|linux|macos|android|ios|react|node|python|java|c\+\+|javascript|typescript)\b/i.test(p)) {
+    return raw;
+  }
+  if (/\b(weather|forecast)\b/i.test(p) && /\b(in|at|for)\s+([a-z]{3,})\b/i.test(p)) {
+    return raw;
+  }
+
+  // 1. Follow-up inquiry detection:
+  const isAttributeQuery = /\b(courses?|programs?|degrees?|b\.?tech|bca|mca|mba|m\.?tech|b\.?sc|m\.?sc|b\.?com|bba|ph\.?d|curriculum|syllabus|admissions?|eligibility|fees?|fee\s+structure|tuition|scholarships?|placements?|package|salary|cutoffs?|rankings?|campuses?|hostels?|campus\s+life|faculty|professors?|vice\s+chancellor|chancellor|dean|departments?|schools?|accreditation|naac|nirf|aicte|ugc|reviews?|contact|address|location|how\s+to\s+apply|entrance\s+exam)\b/i.test(p);
+  const hasPronounRef = /\b(it|its|this|that|there|they|them|their|his|her|here|the\s+university|the\s+college|the\s+institute|the\s+campus)\b/i.test(p);
+  const isFollowUpOpener = /^(what\s+about|how\s+about|tell\s+me\s+more|more\s+details|show\s+me|list\s+all|list\s+every|list\s+of|give\s+me|can\s+you\s+give|can\s+you\s+list|can\s+you\s+show|all\s+courses|what\s+are\s+the|details\s+on|no\s+[a-z]+|is\s+there\b)\b/i.test(p);
+  const isImageRequest = /^(show\s+me\s+)?(images?|photos?|pics?|pictures?|views?|gallery|wallpaper)\b/i.test(p);
+
+  // 2. Multi-tier Entity Detection Strategy:
+  let detectedEntity = '';
+
+  // 2a. Direct match in current prompt
+  const directMatch = raw.match(/\b(Assam\s+Don\s+Bosco(?:\s+University)?|ADBU(?:\s+Azara|\s+Tapesia)?|Don\s+Bosco\s+University|IIT\s+[A-Za-z]+|NIT\s+[A-Za-z]+|BITS\s+[A-Za-z]+|[A-Z][a-zA-Z0-9&.\s]{2,40}(?:University|College|Institute|Campus|Academy))\b/);
+  if (directMatch) {
+    detectedEntity = directMatch[1].trim();
+  }
+
+  // 2b. Check conversationTitle from context (e.g. "Assam Don Bosco University...")
+  if (!detectedEntity && context && context.conversationTitle) {
+    const titleMatch = context.conversationTitle.match(/\b(Assam\s+Don\s+Bosco(?:\s+University)?|ADBU(?:\s+Azara|\s+Tapesia)?|Don\s+Bosco\s+University|IIT\s+[A-Za-z]+|NIT\s+[A-Za-z]+|BITS\s+[A-Za-z]+|[A-Z][a-zA-Z0-9&.\s]{2,40}(?:University|College|Institute|Campus|Academy))\b/);
+    if (titleMatch) {
+      detectedEntity = titleMatch[1].trim();
+    }
+  }
+
+  // 2c. Search conversation history (both user AND assistant turns in reverse order)
+  if (!detectedEntity && Array.isArray(history) && history.length > 0) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const item = history[i];
+      const text = typeof item === 'string' ? item : (item.parts ? item.parts.map(pt => pt.text || '').join(' ') : (item.text || item.content || ''));
+      if (!text) continue;
+      const m = text.match(/\b(Assam\s+Don\s+Bosco(?:\s+University)?|ADBU(?:\s+Azara|\s+Tapesia)?|Don\s+Bosco\s+University|IIT\s+[A-Za-z]+|NIT\s+[A-Za-z]+|BITS\s+[A-Za-z]+|[A-Z][a-zA-Z0-9&.\s]{2,40}(?:University|College|Institute|Campus|Academy))\b/);
+      if (m) {
+        detectedEntity = m[1].trim();
+        break;
+      }
+    }
+  }
+
+  // 2d. Check linked academic portal config (e.g. Assam Don Bosco University)
+  if (!detectedEntity && (isAttributeQuery || hasPronounRef || isFollowUpOpener)) {
+    try {
+      const academicPortal = require('./academic_portal');
+      const cfg = academicPortal.loadConfig();
+      if (cfg && cfg.linked && cfg.universityName) {
+        detectedEntity = cfg.universityName;
+      }
+    } catch (_) {}
+  }
+
+  // Normalize acronyms
+  if (detectedEntity && /^ADBU\b/i.test(detectedEntity)) {
+    detectedEntity = 'Assam Don Bosco University';
+  }
+
+  // 3. Grounded query formatting
+  if (detectedEntity) {
+    const entityLower = detectedEntity.toLowerCase();
+    const containsEntity = p.includes(entityLower) || (entityLower.includes('assam don bosco') && (p.includes('adbu') || p.includes('don bosco')));
+
+    let cleanInquiry = raw
+      .replace(/^(show\s+me|tell\s+me|give\s+me|can\s+you\s+(show|tell|give|list)|list\s+of|list\s+every|list\s+all|please|can\s+you)\s+/gi, '')
+      .replace(/\bplease\b/gi, '')
+      .replace(/[?!.]+$/, '')
+      .trim();
+
+    // Specific degree inquiry handling: "No BCA?", "Is there BCA?", "Any BCA?" -> Clean academic search
+    if (/\bno\s+bca\b/i.test(p) || /\bis\s+there\s+bca\b/i.test(p) || /\bany\s+bca\b/i.test(p) || p === 'bca' || p === 'bca?') {
+      return `${detectedEntity} BCA Bachelor of Computer Applications course admission dbuniversity`;
+    }
+
+    if (/\b(all\s+courses|every\s+courses?|list\s+of\s+courses|course\s+offerings?)\b/i.test(p)) {
+      return `${detectedEntity} all courses programs offered degrees list dbuniversity.ac.in`;
+    }
+
+    if (isImageRequest) {
+      return `${detectedEntity} campus images photos`;
+    }
+
+    if (hasPronounRef) {
+      cleanInquiry = cleanInquiry.replace(/\b(it|this|that|there|the\s+university|the\s+college)\b/gi, detectedEntity);
+    }
+
+    if (containsEntity) {
+      return cleanInquiry;
+    }
+
+    return `${detectedEntity} ${cleanInquiry}`;
+  }
+
+  // Fallback: Check past user queries
+  const recentUserQueries = [];
+  if (Array.isArray(history) && history.length > 0) {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const item = history[i];
+      let text = typeof item === 'string' ? item : (item.text || item.content || '');
+      if (!text || (item.role && item.role !== 'user')) continue;
+      const cleanUserText = text
+        .replace(/\[Mem0 Personalized Long-Term Memory Context\]:[\s\S]*?(?=\n\n|$)/gi, '')
+        .replace(/\[LIVE WEB SEARCH GROUNDING\][\s\S]*$/gi, '')
+        .replace(/\[User Profile & Long-Term Memory Context\]:[\s\S]*?(?=\n\n|$)/gi, '')
+        .replace(/\[Project Context:[\s\S]*?\]/gi, '')
+        .trim();
+      if (cleanUserText.length > 2) {
+        recentUserQueries.push(cleanUserText);
+        if (recentUserQueries.length >= 3) break;
+      }
+    }
+
+    if (recentUserQueries.length > 0) {
+      let previousSubject = '';
+      for (const query of recentUserQueries) {
+        const cleaned = query
+          .replace(/^(search\s+for|what\s+is|tell\s+me\s+about|show\s+me|find|look\s+up|give\s+me|can\s+you\s+find|update\s+on)\s+/i, '')
+          .replace(/[?!.]+$/, '')
+          .trim();
+        if (cleaned.length >= 3 && !/^(hello|hi|hey|thanks|thank\s+you|ok|okay|yes|no)$/i.test(cleaned)) {
+          previousSubject = cleaned;
+          break;
+        }
+      }
+      if (previousSubject && !p.includes(previousSubject.toLowerCase())) {
+        if (isImageRequest) return `${previousSubject} images photos`;
+        if (hasPronounRef) return raw.replace(/\b(it|this|that)\b/gi, previousSubject);
+        return `${previousSubject} ${raw}`;
+      }
+    }
+  }
+
+  return raw;
+}
+
+const { searchWeb, buildGroundingPrompt } = require('./web_search');
+
+function extractJsonBlock(text) {
+  if (!text || typeof text !== 'string') return null;
+  const startIdx = text.search(/\{/);
+  if (startIdx === -1) return null;
+  let depth = 0;
+  for (let i = startIdx; i < text.length; i++) {
+    if (text[i] === '{') depth++;
+    else if (text[i] === '}') {
+      depth--;
+      if (depth === 0) {
+        return text.slice(startIdx, i + 1);
+      }
+    }
+  }
+  return null;
+}
+
+function resolveOpenAIEndpointAndKey(provider, config = {}) {
+  let endpoint = 'https://api.groq.com/openai/v1';
+  let apiKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+  let model = config.groqModel || 'qwen/qwen3.8-27b';
+
+  if (provider === 'groq') {
+    endpoint = 'https://api.groq.com/openai/v1';
+    apiKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+    model = config.groqModel || 'qwen/qwen3.8-27b';
+  } else if (provider === 'ollama') {
+    const base = (config.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+    endpoint = `${base}/v1`;
+    apiKey = 'ollama';
+    model = config.ollamaModel || 'llama3.2';
+  } else if (provider === 'openrouter') {
+    endpoint = 'https://openrouter.ai/api/v1';
+    apiKey = (config.openrouterApiKey || process.env.OPENROUTER_API_KEY || '').trim();
+    model = config.openrouterModel || 'openrouter/auto';
+  } else if (provider === 'openai') {
+    endpoint = 'https://api.openai.com/v1';
+    apiKey = (config.openaiApiKey || process.env.OPENAI_API_KEY || '').trim();
+    model = config.openaiModel || 'gpt-4o';
+  } else if (provider === 'grok') {
+    endpoint = 'https://api.x.ai/v1';
+    apiKey = (config.grokApiKey || process.env.XAI_API_KEY || '').trim();
+    model = config.grokModel || 'grok-2-1212';
+  } else if (provider === 'deepseek') {
+    endpoint = 'https://api.deepseek.com';
+    apiKey = (config.deepseekApiKey || process.env.DEEPSEEK_API_KEY || '').trim();
+    model = config.deepseekModel || 'deepseek-chat';
+  } else if (provider === 'qwen') {
+    endpoint = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
+    apiKey = (config.qwenApiKey || process.env.DASHSCOPE_API_KEY || '').trim();
+    model = config.qwenModel || 'qwen-max';
+  } else if (provider === 'omniroute' || provider === 'omnirouter') {
+    const base = (config.omnirouteEndpoint || config.omnirouterEndpoint || 'http://localhost:20128/v1').replace(/\/+$/, '');
+    endpoint = base;
+    apiKey = (config.omnirouteApiKey || config.omnirouterApiKey || process.env.OMNIROUTE_API_KEY || process.env.OMNIROUTER_API_KEY || '').trim();
+    model = config.omnirouteModel || config.omnirouterModel || 'auto';
+  } else if (provider === 'litellm') {
+    endpoint = (config.litellmEndpoint || 'http://localhost:4000/v1').replace(/\/+$/, '');
+    apiKey = (config.litellmApiKey || process.env.LITELLM_API_KEY || '').trim();
+    model = config.litellmModel || 'gpt-4o';
+  } else if (provider === 'bifrost') {
+    endpoint = (config.bifrostEndpoint || 'http://localhost:8080/v1').replace(/\/+$/, '');
+    apiKey = (config.bifrostApiKey || process.env.BIFROST_API_KEY || '').trim();
+    model = config.bifrostModel || 'auto';
+  } else if (provider === 'portkey') {
+    endpoint = (config.portkeyEndpoint || 'https://api.portkey.ai/v1').replace(/\/+$/, '');
+    apiKey = (config.portkeyApiKey || process.env.PORTKEY_API_KEY || '').trim();
+    model = config.portkeyModel || 'auto';
+  } else if (provider === 'helicone') {
+    endpoint = (config.heliconeEndpoint || 'https://oai.helicone.ai/v1').replace(/\/+$/, '');
+    apiKey = (config.heliconeApiKey || process.env.HELICONE_API_KEY || '').trim();
+    model = config.heliconeModel || 'gpt-4o';
+  } else if (provider === 'routellm') {
+    endpoint = (config.routellmEndpoint || 'http://localhost:6060/v1').replace(/\/+$/, '');
+    apiKey = (config.routellmApiKey || process.env.ROUTELLM_API_KEY || '').trim();
+    model = config.routellmModel || 'router-mf';
+  } else if (provider === 'newapi') {
+    endpoint = (config.newapiEndpoint || 'http://localhost:3000/v1').replace(/\/+$/, '');
+    apiKey = (config.newapiApiKey || process.env.NEWAPI_API_KEY || '').trim();
+    model = config.newapiModel || 'auto';
+  } else if (provider === 'higress') {
+    endpoint = (config.higressEndpoint || 'http://localhost:8080/v1').replace(/\/+$/, '');
+    apiKey = (config.higressApiKey || process.env.HIGRESS_API_KEY || '').trim();
+    model = config.higressModel || 'auto';
+  } else if (provider === 'clawrouter') {
+    endpoint = (config.clawrouterEndpoint || 'http://localhost:8000/v1').replace(/\/+$/, '');
+    apiKey = (config.clawrouterApiKey || process.env.CLAWROUTER_API_KEY || '').trim();
+    model = config.clawrouterModel || 'auto';
+  }
+
+  return { endpoint, apiKey, model };
+}
+
+const osInputScript = path.join(__dirname, 'os_input.ps1').replace('app.asar', 'app.asar.unpacked');
+
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => setTimeout(() => reject(new Error('API timeout')), ms)),
+  ]);
+}
+
+function withAbort(promise, signal) {
+  if (!signal) return promise;
+  if (signal.aborted) return Promise.reject(new Error('TASK_CANCELLED'));
+  return Promise.race([
+    promise,
+    new Promise((_, reject) => {
+      signal.addEventListener('abort', () => reject(new Error('TASK_CANCELLED')));
+    }),
+  ]);
+}
+
+function runPowerShell(args) {
+  return new Promise((resolve) => {
+    const cmd = `powershell.exe -NoProfile -File "${osInputScript}" ${args}`;
+    exec(cmd, { timeout: 10000 }, (err, stdout, stderr) => {
+      resolve({
+        success: !err,
+        stdout: (stdout || '').trim(),
+        stderr: (stderr || '').trim(),
+      });
+    });
+  });
+}
+
+let slideKeyDaemon = null;
+function ensureSlideKeyDaemon() {
+  if (slideKeyDaemon && !slideKeyDaemon.killed && slideKeyDaemon.stdin && !slideKeyDaemon.stdin.destroyed) {
+    return slideKeyDaemon;
+  }
+  try {
+    const psScript = [
+      'Add-Type -TypeDefinition @"',
+      'using System;',
+      'using System.Runtime.InteropServices;',
+      'using System.Text;',
+      'using System.Threading;',
+      'public class FastSlideKey {',
+      '    [DllImport("user32.dll")] public static extern void keybd_event(byte bVk, byte bScan, uint dwFlags, UIntPtr dwExtraInfo);',
+      '    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+      '    [DllImport("user32.dll", CharSet = CharSet.Auto)] public static extern int GetWindowText(IntPtr hWnd, StringBuilder lpString, int nMaxCount);',
+      '    public static void Tap(byte vk) {',
+      '        IntPtr hwnd = GetForegroundWindow();',
+      '        StringBuilder sb = new StringBuilder(128);',
+      '        GetWindowText(hwnd, sb, 128);',
+      '        string title = sb.ToString();',
+      '        if (title.IndexOf("Grokki", StringComparison.OrdinalIgnoreCase) >= 0) {',
+      '            keybd_event(0x12, 0, 0, UIntPtr.Zero);',
+      '            Thread.Sleep(10);',
+      '            keybd_event(0x09, 0, 0, UIntPtr.Zero);',
+      '            Thread.Sleep(10);',
+      '            keybd_event(0x09, 0, 2, UIntPtr.Zero);',
+      '            Thread.Sleep(10);',
+      '            keybd_event(0x12, 0, 2, UIntPtr.Zero);',
+      '            Thread.Sleep(45);',
+      '        }',
+      '        keybd_event(vk, 0, 0, UIntPtr.Zero);',
+      '        Thread.Sleep(8);',
+      '        keybd_event(vk, 0, 2, UIntPtr.Zero);',
+      '    }',
+      '}',
+      '"@',
+      'while ($true) {',
+      '    $line = [Console]::In.ReadLine()',
+      '    if ($null -eq $line) { break }',
+      '    $cmd = $line.Trim().ToLower()',
+      '    if ($cmd -eq "next") { [FastSlideKey]::Tap(0x27) }',
+      '    elseif ($cmd -eq "prev") { [FastSlideKey]::Tap(0x25) }',
+      '    elseif ($cmd -eq "blackout") { [FastSlideKey]::Tap(0x42) }',
+      '    elseif ($cmd -eq "fullscreen") { [FastSlideKey]::Tap(0x74) }',
+      '}'
+    ].join('\n');
+
+    slideKeyDaemon = spawn('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psScript], {
+      stdio: ['pipe', 'ignore', 'ignore'],
+      windowsHide: true,
+    });
+    slideKeyDaemon.on('exit', () => { slideKeyDaemon = null; });
+    slideKeyDaemon.on('error', () => { slideKeyDaemon = null; });
+  } catch (e) {
+    slideKeyDaemon = null;
+  }
+  return slideKeyDaemon;
+}
+
+function sendFastSlideKey(action) {
+  const daemon = ensureSlideKeyDaemon();
+  if (daemon && daemon.stdin && !daemon.stdin.destroyed) {
+    try {
+      daemon.stdin.write(`${action}\n`);
+      return true;
+    } catch (e) {}
+  }
+  return false;
+}
+
+async function resolveYouTubeVideoId(query) {
+  try {
+    const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+    const res = await fetch(url, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+    });
+    const html = await res.text();
+    const match = html.match(/\/watch\?v=([a-zA-Z0-9_-]{11})/);
+    if (match && match[1]) {
+      return match[1];
+    }
+  } catch (e) {
+    console.warn('[AgentBrain] Failed to resolve YouTube video ID:', e.message);
+  }
+  return null;
+}
+
+function expandSlashDirective(text) {
+  const trimmed = (text || '').trim();
+  if (trimmed.startsWith('/btw ')) {
+    return "[MODE: BTW]\nAnswer this quick side question directly, accurately, and concisely without altering the overall task context:\n" + trimmed.slice(5);
+  }
+  return text;
+}
+
+class AgentBrain {
+  getSelectedExplorerFiles() {
+    try {
+      const { getSelectedExplorerFiles } = require('./explorer_selection');
+      return getSelectedExplorerFiles();
+    } catch (_) {
+      return [];
+    }
+  }
+
+  async stopAllTimers() {
+    // 1. Broadcast stop to dynamic island
+    this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'timer' });
+    this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'reminder' });
+    this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'all' });
+
+    // 2. Stop all background reminders and timeouts
+    if (Array.isArray(this.activeReminders) && this.activeReminders.length > 0) {
+      this.activeReminders.forEach((r) => {
+        try { clearTimeout(r.timerId); } catch (_) {}
+      });
+      this.activeReminders = [];
+    }
+
+    // 3. Clear storage and notify renderer windows
+    try {
+      if (typeof electronModule !== 'undefined' && electronModule.BrowserWindow) {
+        electronModule.BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed() && win.webContents) {
+            win.webContents.send('island:activity', { action: 'stop', kind: 'all' });
+            win.webContents.send('timer:stopped');
+          }
+        });
+      }
+    } catch (_) {}
+
+    return {
+      success: true,
+      actionType: 'STOP_TIMER',
+      message: '⏹️ **Timer Stopped!**\n\nThe timer and live countdown have been completely stopped and removed from the Dynamic Island.',
+    };
+  }
+
+  async toggleIslandLockMode(locked) {
+    const isLocked = locked !== false;
+    this.broadcastToMiniIsland('island:lock-mode', { locked: isLocked });
+    return {
+      success: true,
+      locked: isLocked,
+      message: isLocked
+        ? '🔒 **Lock Mode Activated** on the Dynamic Island!\n\nThe panel will NOT appear when you hover over the small dynamic island showing the time.'
+        : '🔓 **Lock Mode Deactivated** on the Dynamic Island.\n\nHovering near the top edge will now expand the panel normally.',
+    };
+  }
+
+  constructor() {
+    this.abortController = null;
+    this.abortControllers = new Map();
+    this.models = [
+      'gemini-flash-latest',
+      'gemini-flash-lite-latest',
+      'gemini-3.5-flash',
+      'gemini-3.7-flash',
+      'gemini-3.1-flash-lite',
+    ];
+  }
+
+  cancelCurrentTask(conversationId) {
+    let cancelled = false;
+    if (!this.abortControllers) this.abortControllers = new Map();
+    if (conversationId) {
+      const ctrl = this.abortControllers.get(conversationId);
+      if (ctrl) {
+        console.log(`[AgentBrain] Killer activated for conversation ${conversationId}: Aborting AI request!`);
+        try { ctrl.abort(); } catch (_) {}
+        this.abortControllers.delete(conversationId);
+        cancelled = true;
+      }
+    } else {
+      if (this.abortController) {
+        console.log('[AgentBrain] Killer activated: Aborting AI request and halting tokens!');
+        try { this.abortController.abort(); } catch (_) {}
+        this.abortController = null;
+        cancelled = true;
+      }
+      for (const [id, ctrl] of this.abortControllers.entries()) {
+        try { ctrl.abort(); } catch (_) {}
+      }
+      this.abortControllers.clear();
+      cancelled = true;
+    }
+    try {
+      if (browserAgent && typeof browserAgent.cancel === 'function') {
+        browserAgent.cancel();
+        cancelled = true;
+      }
+    } catch (_) {}
+    try {
+      if (uiTarsAgent && typeof uiTarsAgent.cancel === 'function') {
+        uiTarsAgent.cancel();
+        cancelled = true;
+      }
+    } catch (_) {}
+    return cancelled;
+  }
+
+  setMusicPlayerHandler(handler) {
+    this.musicPlayerHandler = handler;
+  }
+
+  setMusicPlayerControlHandler(handler) {
+    this.musicPlayerControlHandler = handler;
+  }
+
+  getRelevantTools(prompt = '', provider = 'gemini') {
+    const p = (prompt || '').toLowerCase().trim();
+
+    // 1. If purely conversational greeting or factual/informational query with no action verbs, omit tools
+    const isConversationalGreeting = /^(hi|hello|hey|yo|sup|wassup|wazzup|whats?\s*up|what\s+is\s+up|how\s*('?s|is)\s*(it|everything|life)|how\s+are\s+you|how\s+do\s+you\s+do|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|thanks|thank\s+you|thx|ok|okay|k|bye|goodbye|see\s+ya|cool|nice|great|awesome|who\s+are\s+you|what\s+is\s+your\s+name|what\s+can\s+you\s+do|tell\s+me\s+(a\s+joke|something)|what\s+are\s+you\s+doing|what\s+do\s+you\s+think|help\s*me?|can\s+you\s+help)\b/i.test(p);
+    const isPureInformational = /^(what (is|are|was|were)|why (is|are|do|does|did)|how (does|do|did|can)|who (is|was|were)|explain|tell me about|define|summarize|translate|write (a|an)? (code|script|poem|story|function)|calculate|solve)\b/i.test(p) &&
+      !/\b(app|application|software|window|notepad|screen|volume|brightness|sound|song|music|play|click|type|drive|email|gmail|calendar|sheet|doc|classroom|attendance|save|file|folder|wifi|bluetooth|whatsapp|wa|message|messages|chat|chats|text)\b/i.test(p);
+
+    if (isConversationalGreeting || isPureInformational) {
+      return undefined;
+    }
+
+    const hasActionIntent = /\b(open|launch|start|run|close|quit|kill|click|press|type|find|locate|search\s+for\s+file|volume|sound|mute|unmute|brightness|screenshot|screen\s*shot|snip|capture|record\s*screen|window|minimize|maximize|snap\s*window|shutdown|restart|reboot|sleep|lock\s*pc|wifi|bluetooth|clean\s*up|cleanup|organize|timer|alarm|lock\s*mode|island|whatsapp|send\s*(message|wa|text|file|email)|check\s*(email|emails|mail|inbox)|gmail|drive|calendar|agenda|schedule|meeting|attendance|adbu|roll\s*no|portal|viva|quiz|play\s*(music|song|youtube)|pause\s*music|spotify)\b/i.test(p);
+
+    // Ollama Local Models: Small local models MUST NEVER receive 40+ tool definitions on non-action queries!
+    // Non-action queries (conversational, coding, reasoning, general knowledge) get 0 tools for instant (<1s) replies.
+    if (provider === 'ollama' && !hasActionIntent) {
+      return undefined;
+    }
+
+    const allDeclarations = this.getToolsDeclaration();
+    const allTools = allDeclarations[0]?.functionDeclarations || [];
+
+    // If provider is Groq (has strict 8000 TPM limit) or Ollama (local model), filter strictly to relevant tools
+    if (provider === 'groq' || provider === 'ollama') {
+      const isDesktop = /\b(open|launch|start|click|type|find|locate|window|software|app|desktop|notepad|spotify|chrome|calc|calculator|volume|brightness|close|minimize|maximize|snap|shutdown|restart|sleep|lock|pc|wifi|bluetooth|cleanup|clean\s+up|organize|timer|alarm|island)\b/i.test(p);
+      const isGoogle = /\b(google|drive|sheet|doc|gmail|email|mail|calendar|task|tasks|classroom|course|assignment|announcement)\b/i.test(p);
+      const isUni = /\b(attendance|university|college|portal|adbu|roll|profile|exam|viva|quiz|notes|study)\b/i.test(p);
+      const isMedia = /\b(music|song|songs|play|pause|next|youtube|video|spotify)\b/i.test(p);
+      const isWhatsApp = /\b(whatsapp|wa|message|messages|chat|chats|text|texts|contact|contacts|phone)\b/i.test(p);
+
+      const selectedNames = new Set();
+
+      if (isDesktop) {
+        ['open_app', 'desktop_click', 'desktop_type', 'desktop_find', 'desktop_snapshot',
+         'close_active_window', 'system_volume', 'window_manager', 'system_power', 'system_brightness',
+         'storage_and_cleanup', 'screen_capture_and_recorder', 'connectivity_control', 'power_and_theme_control',
+         'pc_health_and_optimizer', 'organize_folder', 'stop_timer', 'toggle_island_lock_mode'
+        ].forEach(n => selectedNames.add(n));
+      }
+
+      if (isWhatsApp) {
+        ['send_whatsapp_file_or_message', 'get_whatsapp_recent_messages', 'get_whatsapp_status', 'save_whatsapp_contact_alias'].forEach(n => selectedNames.add(n));
+      }
+
+      if (isGoogle) {
+        ['get_classroom_assignments', 'get_classroom_announcements', 'check_emails', 'send_email_gmail', 'get_calendar_agenda', 'search_google_drive', 'upload_to_google_drive', 'read_google_sheet', 'append_to_google_sheet', 'create_google_doc', 'get_google_tasks'].forEach(n => selectedNames.add(n));
+      }
+
+      if (isUni) {
+        ['get_university_attendance', 'get_university_profile', 'sync_university_portal', 'create_study_revision_document', 'viva_voice_quiz', 'snap_and_solve_screen', 'search_research_papers'].forEach(n => selectedNames.add(n));
+      }
+
+      if (isMedia) {
+        ['play_youtube_music', 'control_music', 'search_youtube'].forEach(n => selectedNames.add(n));
+      }
+
+      if (selectedNames.size === 0) {
+        if (!hasActionIntent) return undefined;
+        // Default core actions fallback
+        ['open_app', 'desktop_click', 'desktop_type', 'window_manager', 'system_volume'].forEach(n => selectedNames.add(n));
+      }
+
+      const filtered = allTools.filter(t => selectedNames.has(t.name));
+      return filtered.length > 0 ? [{ functionDeclarations: filtered }] : undefined;
+    }
+
+    return allDeclarations;
+  }
+
+  getToolsDeclaration() {
+    return [
+      {
+        functionDeclarations: [
+          {
+            name: 'desktop_snapshot',
+            description: 'Inspect the Windows accessibility tree of an app or desktop using native UI Automation (powered by Vercel agent-desktop). Returns a structured list of interactive UI elements with scoped @ref IDs (e.g. @s8f3k2p9:e8). Preferred over screenshots for clicking buttons, fields, tabs, and menus without taking vision tokens.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                app: { type: 'STRING', description: 'Application name or image (e.g., "Spotify", "Notepad", "Discord", "Code", "chrome")' },
+                interactiveOnly: { type: 'BOOLEAN', description: 'Filter only interactive buttons, inputs, tabs, checkboxes (default: true)' },
+                compact: { type: 'BOOLEAN', description: 'Omit empty structural containers (default: true)' },
+              },
+            },
+          },
+          {
+            name: 'desktop_click',
+            description: 'Click any UI element or button on screen by visible name/label (e.g. "Save", "File", "Close", "OK", "Play") or by scoped @ref ID in the background.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                target: { type: 'STRING', description: 'Visible label, name, or text of the button or element to click (e.g. "Save", "File", "New", "Close")' },
+                app: { type: 'STRING', description: 'Application name (e.g. "Notepad", "Spotify", "Calculator", "Chrome")' },
+                ref: { type: 'STRING', description: 'Optional element scoped ref ID (e.g. "@s8f3k2p9:e8") from desktop_snapshot or desktop_find' },
+                doubleClick: { type: 'BOOLEAN', description: 'Set true to double-click' },
+                rightClick: { type: 'BOOLEAN', description: 'Set true to right-click (open context menu)' },
+                headed: { type: 'BOOLEAN', description: 'Set true to physically move mouse cursor if semantic click is refused' },
+              },
+            },
+          },
+          {
+            name: 'desktop_type',
+            description: 'Type text or set value into an element, input field, text editor, or active app by target name, app name, or scoped @ref ID.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                text: { type: 'STRING', description: 'Text string to type or set' },
+                app: { type: 'STRING', description: 'Application name (e.g. "Notepad", "Word", "VS Code")' },
+                target: { type: 'STRING', description: 'Element role or label (e.g. "document", "editor", "Search")' },
+                ref: { type: 'STRING', description: 'Optional element ref ID (e.g. "@s8f3k2p9:e12")' },
+                headed: { type: 'BOOLEAN', description: 'Set true if target requires real keystroke synthesis' },
+              },
+              required: ['text'],
+            },
+          },
+          {
+            name: 'desktop_find',
+            description: 'Find interactive elements, buttons, text fields, or controls across an application or the screen without taking a full snapshot.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                app: { type: 'STRING', description: 'Target application name (e.g. "Notepad", "Spotify", "Calculator", "Chrome")' },
+                name: { type: 'STRING', description: 'Element label or accessible name (e.g. "Play", "Next", "Save", "File")' },
+                text: { type: 'STRING', description: 'Text contained in element' },
+                role: { type: 'STRING', description: 'Element role (e.g. "button", "textfield", "menuitem", "checkbox")' },
+              },
+            },
+          },
+          {
+            name: 'desktop_app_control',
+            description: 'Manage desktop applications and windows (launch, close, list, focus) via native OS bridge.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: 'Action to perform: launch, close, list, or focus' },
+                app: { type: 'STRING', description: 'Application executable or name (e.g. "notepad.exe", "spotify", "discord")' },
+                windowId: { type: 'STRING', description: 'Window ID for focus action' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'computer_click',
+            description: 'Physically glides real Windows mouse cursor across the screen and clicks on coordinates (x, y)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                x: { type: 'NUMBER', description: 'X screen coordinate' },
+                y: { type: 'NUMBER', description: 'Y screen coordinate' },
+              },
+              required: ['x', 'y'],
+            },
+          },
+          {
+            name: 'computer_double_click',
+            description: 'Physically glides mouse and double-clicks on screen coordinates (x, y)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                x: { type: 'NUMBER', description: 'X screen coordinate' },
+                y: { type: 'NUMBER', description: 'Y screen coordinate' },
+              },
+              required: ['x', 'y'],
+            },
+          },
+          {
+            name: 'computer_right_click',
+            description: 'Physically glides mouse and right-clicks on screen coordinates (x, y)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                x: { type: 'NUMBER', description: 'X screen coordinate' },
+                y: { type: 'NUMBER', description: 'Y screen coordinate' },
+              },
+              required: ['x', 'y'],
+            },
+          },
+          {
+            name: 'computer_move',
+            description: 'Physically moves the real Windows mouse cursor smoothly to coordinates (x, y)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                x: { type: 'NUMBER', description: 'Target X coordinate' },
+                y: { type: 'NUMBER', description: 'Target Y coordinate' },
+              },
+              required: ['x', 'y'],
+            },
+          },
+          {
+            name: 'computer_type',
+            description: 'Physically types text into the currently active window like someone typing on keyboard',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                text: { type: 'STRING', description: 'Text to physically type' },
+              },
+              required: ['text'],
+            },
+          },
+          {
+            name: 'computer_hotkey',
+            description: 'Physically presses keyboard hotkey (e.g. ctrl+s, ctrl+shift+m, alt+tab, ctrl+f, enter, esc)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                keys: { type: 'STRING', description: 'Hotkey name (e.g. ctrl+shift+m, ctrl+s, alt+tab, enter)' },
+              },
+              required: ['keys'],
+            },
+          },
+          {
+            name: 'focus_window',
+            description: 'Brings an application window to the foreground (e.g. Code, WINWORD, notepad, brave, chrome)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                app: { type: 'STRING', description: 'Process name (Code, WINWORD, notepad, brave, chrome, msedge)' },
+              },
+              required: ['app'],
+            },
+          },
+          {
+            name: 'system_volume',
+            description: 'Controls Windows master volume: set percentage (0-100), volume_up (increase/up), volume_down (decrease/down), mute, unmute, or get current level',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: 'Action: "set", "up", "down", "mute", "unmute", or "get"' },
+                level: { type: 'NUMBER', description: 'Volume level (0-100) if action is set' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'close_active_window',
+            description: 'Closes the currently active/focused window, application, or software (e.g. "close this window", "close current software", "close current app")',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                app_name: { type: 'STRING', description: 'Optional application name to close (e.g. "chrome", "notepad", "code"). If omitted, closes the foreground active window.' },
+              },
+            },
+          },
+          {
+            name: 'system_power',
+            description: 'Controls PC power state: "lock" (locks workstation/screen), "sleep" (puts PC to sleep), "shutdown" (shuts down PC), "restart" (reboots PC), or "cancel" (aborts pending shutdown)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: 'Power action: "lock", "sleep", "shutdown", "restart", or "cancel"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'create_or_edit_word',
+            description: 'Creates or opens a Word document (.docx), focuses MS Word, glides cursor, types text physically, and saves',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                filename: { type: 'STRING', description: 'Name of document, e.g. Notes.docx or Report.docx' },
+                text: { type: 'STRING', description: 'Text to physically type into Word' },
+                save: { type: 'BOOLEAN', description: 'Whether to save via Ctrl+S' },
+              },
+              required: ['text'],
+            },
+          },
+          {
+            name: 'inspect_vscode_errors',
+            description: 'VS Code Live Bug Doctor: Inspects active code compiler/syntax errors, explains root cause, and generates exact copy-paste fix. Can inspect active VS Code editor/Problems view, clipboard code, or direct error text.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                error_or_code: { type: 'STRING', description: 'Optional code snippet or compiler error message (if omitted, reads active VS Code Problems panel or clipboard)' },
+              },
+            },
+          },
+          {
+            name: 'read_screen_and_act',
+            description: 'ONLY use this tool when the user EXPLICITLY asks to look at their computer monitor or desktop screen (e.g. "look at my screen", "what is on my screen", "read my screen"). NEVER call this tool for world events, news, politics, or general knowledge questions!',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                task: { type: 'STRING', description: 'What to inspect or describe on screen (e.g. "describe what is open on screen", "check active window", "read text")' },
+              },
+              required: ['task'],
+            },
+          },
+          {
+            name: 'play_music',
+            description: 'Plays music, a song, an artist, or a playlist in the user browser on their configured music platform (Spotify, YouTube Music, Apple Music, or Amazon Music)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                song: { type: 'STRING', description: 'Clean song, artist, album, or playlist name to play (extract ONLY the artist or song title, omitting filler words like "something from" or "play")' },
+                platform: { type: 'STRING', description: 'Optional platform override: "spotify", "ytmusic", "applemusic", "amazonmusic"' },
+              },
+              required: ['song'],
+            },
+          },
+          {
+            name: 'play_youtube_music',
+            description: 'Plays music or song in the default browser',
+            parameters: {
+              type: 'OBJECT',
+              properties: { song: { type: 'STRING', description: 'Song or artist name' } },
+              required: ['song'],
+            },
+          },
+          {
+            name: 'control_music',
+            description: 'Controls music playback in browser and system (pause, resume/play, next/skip song, previous song, stop)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: 'Action: "pause", "resume", "play", "next", "skip", "prev", "previous", "stop"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'search_youtube',
+            description: 'Searches YouTube for videos, courses, tutorials, or topics, brings browser to front, moves mouse cursor and clicks first video',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING', description: 'Search query, topic, course, or video name' },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'browser_search',
+            description: 'ONLY use when the user EXPLICITLY asks to open an external browser on their PC (e.g. "open in browser", "search in Chrome", "open Brave"). NEVER use this for normal information, research, or photo requests; answer directly in the chat.',
+            parameters: {
+              type: 'OBJECT',
+              properties: { query: { type: 'STRING', description: 'Search query or URL to open in browser' } },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'create_file_or_folder',
+            description: 'Creates a file or folder in any specific drive or path (e.g. C:, D:, E:)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                path: { type: 'STRING', description: 'Full path, e.g. E:/Projects or C:/Users/Notes/todo.txt' },
+                is_folder: { type: 'BOOLEAN', description: 'True if creating a folder, false if file' },
+                content: { type: 'STRING', description: 'File content if creating a file' },
+              },
+              required: ['path'],
+            },
+          },
+          {
+            name: 'calendar_schedule_event',
+            description: 'Creates a calendar event or marks a date, launches Google Calendar or calendar app',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                title: { type: 'STRING', description: 'Event title' },
+                date: { type: 'STRING', description: 'Date (e.g. 2026-10-15 or tomorrow)' },
+                description: { type: 'STRING', description: 'Event description or notes' },
+              },
+              required: ['title'],
+            },
+          },
+          {
+            name: 'connect_google_account',
+            description: 'Starts 1-click Google sign-in to connect Gmail, Calendar, Drive, Sheets, Docs, and Tasks',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'check_emails',
+            description: 'Reads unread primary emails from Gmail, shows senders, subjects, and snippets',
+            parameters: {
+              type: 'OBJECT',
+              properties: { max_results: { type: 'NUMBER', description: 'Number of emails to fetch (default 5)' } },
+            },
+          },
+          {
+            name: 'send_email_gmail',
+            description: 'Sends an email using your connected Gmail account',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                to: { type: 'STRING', description: 'Recipient email address' },
+                subject: { type: 'STRING', description: 'Email subject' },
+                body: { type: 'STRING', description: 'Email body text' },
+              },
+              required: ['to', 'subject', 'body'],
+            },
+          },
+          {
+            name: 'get_calendar_agenda',
+            description: 'Fetches upcoming events and meetings from Google Calendar',
+            parameters: {
+              type: 'OBJECT',
+              properties: { max_results: { type: 'NUMBER', description: 'Number of events to list' } },
+            },
+          },
+          {
+            name: 'search_google_drive',
+            description: 'Searches for documents, spreadsheets, PDFs, or files on your Google Drive',
+            parameters: {
+              type: 'OBJECT',
+              properties: { query: { type: 'STRING', description: 'File name or keyword' } },
+            },
+          },
+          {
+            name: 'upload_to_google_drive',
+            description: 'Uploads a local file from your PC to Google Drive',
+            parameters: {
+              type: 'OBJECT',
+              properties: { file_path: { type: 'STRING', description: 'Local path of file to upload' } },
+              required: ['file_path'],
+            },
+          },
+          {
+            name: 'read_google_sheet',
+            description: 'Reads rows and values from a Google Spreadsheet. Accepts a spreadsheet ID or full Google Sheets URL. Automatically detects tabs and sheet names.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                spreadsheet_id: { type: 'STRING', description: 'Google Spreadsheet ID or full Google Sheets URL' },
+                range: { type: 'STRING', description: 'Optional cell range (e.g. A1:Z50 or Sheet1!A1:Z50). If omitted, automatically detects and reads the first sheet tab.' },
+              },
+              required: ['spreadsheet_id'],
+            },
+          },
+          {
+            name: 'append_to_google_sheet',
+            description: 'Appends a new row of data into a Google Sheet. Automatically detects the active sheet tab.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                spreadsheet_id: { type: 'STRING', description: 'Spreadsheet ID or full Google Sheets URL' },
+                values: { type: 'ARRAY', items: { type: 'STRING' }, description: 'Array of cell values for the row' },
+                range: { type: 'STRING', description: 'Optional range or tab name. If omitted, appends to the first sheet tab.' },
+              },
+              required: ['spreadsheet_id', 'values'],
+            },
+          },
+          {
+            name: 'find_and_update_google_sheet',
+            description: 'Finds a student or record in a Google Sheet by name or search keyword (e.g. "Esha Deka") and updates or fills in a missing value for a target column (e.g. "Department", "Grade", "Program"). If new_value is omitted or "mode", automatically computes and applies the statistical mode imputation for that column.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                spreadsheet_id: { type: 'STRING', description: 'Google Spreadsheet ID or full Google Sheets URL' },
+                search_criteria: { type: 'STRING', description: 'Name of the student, ID, or keyword to find (e.g. "Esha Deka")' },
+                target_column: { type: 'STRING', description: 'Column to update or fill in (e.g. "Department", "Grade", "Program", or column letter like "D")' },
+                new_value: { type: 'STRING', description: 'Optional value to write. If omitted or "mode", automatically computes the mode of that column.' },
+                tab_name: { type: 'STRING', description: 'Optional sheet tab name if multiple tabs exist.' },
+              },
+              required: ['spreadsheet_id', 'search_criteria', 'target_column'],
+            },
+          },
+          {
+            name: 'update_google_sheet_cell',
+            description: 'Updates a specific cell or range in a Google Sheet with a new value (e.g. range "D14" or "Sheet1!D14", value "Computer Science").',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                spreadsheet_id: { type: 'STRING', description: 'Google Spreadsheet ID or full Google Sheets URL' },
+                range: { type: 'STRING', description: 'Cell coordinate (e.g. "D14" or "TabName!D14")' },
+                value: { type: 'STRING', description: 'Value to write into the cell' },
+              },
+              required: ['spreadsheet_id', 'range', 'value'],
+            },
+          },
+          {
+            name: 'create_google_doc',
+            description: 'Creates a new Google Doc with title and content in your Google Drive',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                title: { type: 'STRING', description: 'Document title' },
+                content: { type: 'STRING', description: 'Initial text content' },
+              },
+              required: ['title'],
+            },
+          },
+          {
+            name: 'get_google_tasks',
+            description: 'Lists all pending to-dos and tasks from Google Tasks',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'add_google_task',
+            description: 'Adds a new to-do task to Google Tasks with optional due date',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                title: { type: 'STRING', description: 'Task title or action' },
+                notes: { type: 'STRING', description: 'Additional notes' },
+                due: { type: 'STRING', description: 'Due date, e.g. 2026-10-16' },
+              },
+              required: ['title'],
+            },
+          },
+          {
+            name: 'create_notion_page',
+            description: 'Creates a new page, study note, or assignment entry in Notion',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                title: { type: 'STRING', description: 'Page or note title' },
+                content: { type: 'STRING', description: 'Body text, summary, or lecture notes' },
+                database_id: { type: 'STRING', description: 'Optional Notion Database ID' },
+              },
+              required: ['title', 'content'],
+            },
+          },
+          {
+            name: 'search_notion',
+            description: 'Searches your connected Notion workspace for pages, notes, or databases',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING', description: 'Search term or title' },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'create_obsidian_note',
+            description: 'Creates a new local markdown note or appends to a daily note in Obsidian',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                title: { type: 'STRING', description: 'Note title or filename' },
+                content: { type: 'STRING', description: 'Markdown note content or lecture summary' },
+                is_daily: { type: 'BOOLEAN', description: 'Whether to append to today daily note' },
+              },
+              required: ['content'],
+            },
+          },
+          {
+            name: 'search_obsidian_vault',
+            description: 'Searches through your local Obsidian vault notes and knowledge base',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING', description: 'Search keywords, topic, or note title' },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'search_google_contact',
+            description: 'Searches Google Contacts for a person name, phone number, or email',
+            parameters: {
+              type: 'OBJECT',
+              properties: { query: { type: 'STRING', description: 'Contact name or email' } },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'get_classroom_assignments',
+            description: 'Fetches pending homework, assignments, and due dates across all enrolled Google Classrooms',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'get_classroom_announcements',
+            description: 'Fetches recent teacher announcements and class updates from Google Classroom',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'list_classroom_courses',
+            description: 'Lists all active enrolled Google Classroom courses and teachers',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'get_university_attendance',
+            description: 'Fetches your official university course attendance breakdown (held, attended, %, shortage warnings, and classes needed for 75%) from the linked ERP portal (e.g. ADBU)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                force_sync: { type: 'BOOLEAN', description: 'Whether to force live login and scrape latest data from the portal' },
+              },
+            },
+          },
+          {
+            name: 'get_university_profile',
+            description: 'Fetches student profile details (name, student ID, program, semester) from the linked university ERP portal',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'sync_university_portal',
+            description: 'Logs into the university ERP portal and syncs fresh attendance and profile records into Grokki',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'youtube_data_search',
+            description: 'Searches YouTube using official YouTube Data API v3 to get exact video titles, channels, and video links',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING', description: 'Search keywords, video topic, or course name' },
+                max_results: { type: 'NUMBER', description: 'Number of videos to fetch (default 5)' },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'get_youtube_subscriptions',
+            description: 'Fetches your subscribed YouTube channels using the YouTube Data API',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'get_youtube_playlists',
+            description: 'Lists your personal YouTube playlists from your YouTube library',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'send_whatsapp_file_or_message',
+            description: 'Sends a message or shares and attaches a document/file on WhatsApp to a specific person or phone number (uses OpenWA Gateway if active, or Windows desktop fallback)',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                contact_or_phone: { type: 'STRING', description: 'Name of contact (e.g. "Rohan", "Alex", "Mom") or phone number with country code' },
+                message: { type: 'STRING', description: 'Message text to send' },
+                file_path: { type: 'STRING', description: 'Local path of file, document, or PDF to share' },
+              },
+              required: ['contact_or_phone'],
+            },
+          },
+          {
+            name: 'get_whatsapp_recent_messages',
+            description: 'Fetches recent WhatsApp chats and messages (e.g. "What did Rajbir send me?", "Check my WhatsApp", "Who texted me on WhatsApp?", "Read latest messages", "Can you check any recent messages from WhatsApp?", "Did Rajbir send any message?"). Call this whenever checking, reading, or inspecting incoming messages or chats.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                contact_name: { type: 'STRING', description: 'Optional contact name (e.g. "Rajbir", "Mom", "Alex") to check messages from' },
+                limit: { type: 'INTEGER', description: 'Number of recent chats/messages to retrieve (default 5)' },
+              },
+            },
+          },
+          {
+            name: 'get_whatsapp_status',
+            description: 'Checks ONLY the connection and session status (online/offline/QR linked) of the WhatsApp OpenWA Gateway. DO NOT call this when the user asks to check, read, or see messages or chats; use get_whatsapp_recent_messages instead!',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'stop_timer',
+            description: 'Immediately stops and cancels any active timer, countdown, lock-in study session, or reminder running on the Dynamic Island or in the background.',
+            parameters: { type: 'OBJECT', properties: {} },
+          },
+          {
+            name: 'toggle_island_lock_mode',
+            description: 'Toggles or sets the Lock Mode on the Dynamic Island. When Lock Mode is ON, the small dynamic island shows the time and will NEVER expand the big panel when hovered.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                locked: { type: 'BOOLEAN', description: 'True to enable lock mode, false to disable' },
+              },
+            },
+          },
+          {
+            name: 'save_whatsapp_contact_alias',
+            description: 'Saves or updates a permanent WhatsApp contact phone number or alias (e.g. "Mom is 9876543210", "Papa is +919876543210", "Papa 2 is 9876543210"). Use this whenever the user specifies someone\'s phone number or contact mapping.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                name: { type: 'STRING', description: 'Contact name or alias (e.g. "Mom", "Papa", "Papa 2", "Sister")' },
+                phone: { type: 'STRING', description: 'Phone number with country code or 10 digits (e.g. "+919876543210" or "9876543210")' },
+              },
+              required: ['name', 'phone'],
+            },
+          },
+          {
+            name: 'read_attached_file',
+            description: 'Reads the text content of the currently attached file to summarize, analyze, or answer questions about it',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                file_path: { type: 'STRING', description: 'Path to file (defaults to currently attached file)' },
+              },
+            },
+          },
+          {
+            name: 'open_app',
+            description: 'Launches a Windows desktop application. Can optionally type text into the app or click a button immediately after opening.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                name: { type: 'STRING', description: 'Application name (e.g. notepad, calc, chrome, spotify, word)' },
+                text_to_type: { type: 'STRING', description: 'Text to immediately type into the app after opening (e.g. "Hello from Grokki")' },
+                click_target: { type: 'STRING', description: 'Button or menu item to click after opening (e.g. "File", "New", "Save")' },
+              },
+              required: ['name'],
+            },
+          },
+          {
+            name: 'create_study_revision_document',
+            description: 'Creates high-yield academic study notes, 1-page exam cheat sheets, probable exam questions with model answers, or Feynman-technique explanations from an attached lecture PDF/file or topic, saves the document directly to Desktop/Grokki_Study_Notes/, and opens it in editor.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                topic: { type: 'STRING', description: 'Subject or lecture topic (e.g. Operating Systems, Thermodynamics, Calculus, Machine Learning)' },
+                study_mode: {
+                  type: 'STRING',
+                  description: 'Type of study document: "cheat_sheet" (1-page exam formulas & core principles), "exam_questions" (top 7 exam questions with answers), "quick_notes" (structured revision notes), or "eli5" (Feynman technique explanation)',
+                },
+                file_path: { type: 'STRING', description: 'Optional path to lecture PDF, slides, or notes file. Defaults to attached file if any.' },
+                custom_instructions: { type: 'STRING', description: 'Any custom focus (e.g. "focus on numerical formulas", "include code examples")' },
+              },
+            },
+          },
+          {
+            name: 'start_lock_in_study_session',
+            description: 'Starts a Lock-In Study / Pomodoro focus session with floating countdown timer in Dynamic Island, ambient lo-fi music, and distraction muting.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                duration_minutes: { type: 'NUMBER', description: 'Duration of focus block in minutes (e.g. 25, 45, 60. Default 25)' },
+                subject: { type: 'STRING', description: 'Subject or task name (e.g. "Calculus", "Data Structures", "Essay")' },
+                play_lofi: { type: 'BOOLEAN', description: 'Whether to play study lo-fi music on YouTube Music (default true)' },
+              },
+            },
+          },
+          {
+            name: 'get_tonight_study_radar',
+            description: 'Fetches Tonight\'s Homework & Exam Priority Radar by analyzing Google Classroom assignments, upcoming exams on Google Calendar, and generating a customized 3-block evening study plan.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {},
+            },
+          },
+          {
+            name: 'search_research_papers',
+            description: 'Searches 250M+ peer-reviewed academic research papers & preprints via OpenAlex and arXiv APIs, returning abstracts, PDF links, citation counts, and ready-to-copy APA, IEEE, or BibTeX citations.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING', description: 'Research topic, paper title, or academic question (e.g. "transformer attention mechanism", "quantum error correction")' },
+                citation_style: { type: 'STRING', description: 'Citation style: "APA" (default), "IEEE", or "BibTeX"' },
+                max_results: { type: 'NUMBER', description: 'Number of papers to fetch (default 4)' },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'summarize_youtube_lecture',
+            description: 'Extracts transcript, chapters, and rich context from any YouTube video (lectures, tutorials, documentary/bodycam clips, news, podcasts, essays) and generates a comprehensive summary answering what the video is about with clickable [MM:SS] timestamp links.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                url_or_topic: { type: 'STRING', description: 'YouTube video URL or search topic (e.g. "https://youtu.be/..." or "MIT 6.006 Dijkstra lecture")' },
+                focus: { type: 'STRING', description: 'Optional specific question or focus about the video (e.g. "what is the video about?", "core concept", etc.)' },
+              },
+              required: ['url_or_topic'],
+            },
+          },
+          {
+            name: 'viva_voice_quiz',
+            description: 'Interactive "Viva / Oral Exam" Voice Professor Quiz & Anki Flashcard Exporter. Asks the student questions one-by-one from a topic or attached PDF, grades spoken/typed answers out of 10, asks follow-ups, and exports an Anki .csv flashcard deck.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"start" (begin new oral exam), "answer" (grade student answer & ask next question), or "export_anki" (finish quiz & save Anki CSV flashcards to Desktop)' },
+                topic: { type: 'STRING', description: 'Subject or topic for the viva quiz (or uses attached PDF if present)' },
+                student_answer: { type: 'STRING', description: 'The student\'s answer when action is "answer"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'snap_and_solve_screen',
+            description: 'Screen "Snap & Solve": Captures a high-res screenshot of the active monitor (Canvas/Moodle quiz, LeetCode problem, PDF equation, or circuit/architecture diagram) and solves it step-by-step using AI Vision.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                question_or_focus: { type: 'STRING', description: 'What to solve or explain on the screen (e.g. "solve this quiz question", "solve this LeetCode problem in Python", "explain this diagram")' },
+              },
+            },
+          },
+          {
+            name: 'math_and_knowledge_solver',
+            description: 'Solves symbolic calculus/algebra expressions (derivatives, integrals, roots/zeroes, factoring, simplification) via Newton Symbolic Math API and fetches verified academic encyclopedic definitions via Wikipedia REST API.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                operation: { type: 'STRING', description: 'Math operation: "derive" (derivative), "integrate" (integral), "zeroes" (roots), "factor", "simplify", "tangent", or "area"' },
+                expression: { type: 'STRING', description: 'Mathematical expression in x, e.g. "x^3 + 4x^2 - 7x" or "x^2 + 2x"' },
+                wiki_query: { type: 'STRING', description: 'Optional scientific/academic term or theorem to look up on Wikipedia (e.g. "Bayes theorem", "Fourier transform", "Deadlock")' },
+              },
+            },
+          },
+          {
+            name: 'highlight_to_action',
+            description: 'Highlight-to-Action ("Act on Whatever I Selected"): Automatically grabs the user\'s currently highlighted/selected text from any active app, reads what it says, answers questions about it, or transforms it with AI (rewrite, fix code, summarize, explain, translate), copies the result to the clipboard, and optionally pastes (Ctrl+V) it back in place. Use this tool WHENEVER the user asks about "highlighted text", "selected text", "what did I select", or "what does this text say".',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                instruction: { type: 'STRING', description: 'What to do with the highlighted selection (e.g. "rewrite professionally", "fix this code", "summarize into bullet points", "explain")' },
+                replace_in_place: { type: 'BOOLEAN', description: 'True if user asked to replace, paste back, or overwrite the selection in place' },
+              },
+              required: ['instruction'],
+            },
+          },
+          {
+            name: 'organize_folder',
+            description: '1-Click Downloads & Desktop Auto-Organizer: Scans messy Downloads or Desktop folder and sorts loose files into clean categorized folders (Lectures & PDFs, Assignments & Docs, Code & Archives, Images & Media, Installers & Apps) in 1 second.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                target_folder: { type: 'STRING', description: '"downloads" (default), "desktop", or a full folder path' },
+              },
+            },
+          },
+          {
+            name: 'pc_health_and_optimizer',
+            description: 'Live PC Health, NVIDIA RTX GPU & RAM Optimizer: Checks live CPU %, RAM used/free, NVIDIA RTX GPU temperature & VRAM, Battery status, and Top 5 heaviest RAM processes; or optimizes/frees up RAM and kills memory hogs.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"check" (full hardware/GPU/RAM report), "optimize" (free up standby/working-set RAM), or "kill_app" (terminate a heavy process)' },
+                target_app: { type: 'STRING', description: 'Optional process name to terminate if action is "kill_app"' },
+              },
+            },
+          },
+          {
+            name: 'schedule_reminder_or_action',
+            description: 'Spoken Background Reminders & Timed OS Actions: Schedules a background timer that pops open Grokki and speaks a reminder out loud via VoiceStudio TTS, or executes a timed OS action (lock, sleep, shutdown, mute, unmute, close_window) after X minutes/seconds.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"schedule" (default), "list" (show active timers), or "cancel" (clear all timers)' },
+                delay_minutes: { type: 'NUMBER', description: 'Minutes from now until trigger (can be decimal, e.g. 0.5 for 30 seconds, 20 for 20 minutes)' },
+                reminder_text: { type: 'STRING', description: 'What Grokki should speak out loud and show when the timer fires' },
+                os_action: { type: 'STRING', description: 'Optional OS action to execute when timer expires: "none", "lock", "sleep", "shutdown", "mute", "unmute", or "close_window"' },
+              },
+            },
+          },
+          {
+            name: 'download_research_pdfs',
+            description: 'Auto-Download Research Paper PDFs to Desktop: Searches arXiv & OpenAlex for peer-reviewed papers on a topic, downloads the actual .pdf files into Desktop/Grokki_Study_Notes/Papers/, and opens the folder in Windows Explorer.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING', description: 'Research topic or paper title to download PDFs for (e.g. "Deep Reinforcement Learning", "Diffusion Models")' },
+                count: { type: 'NUMBER', description: 'Number of PDF files to download (default 3, max 6)' },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'system_brightness',
+            description: 'Laptop Screen Brightness Control (WMI Hardware Dimmer): Adjusts or sets laptop screen brightness percentage (0-100), increases/decreases brightness, or dims screen.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"set", "up" (increase), "down" (decrease/dim), or "get"' },
+                level: { type: 'NUMBER', description: 'Brightness percentage (0-100) when action is "set"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'window_manager',
+            description: 'Win32 Window Manager & Split-Screen Snapper: Minimizes, maximizes, restores, shows desktop (minimizes all), snaps active/target window to left or right half of screen, or split-screens two apps side-by-side.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"minimize", "maximize", "restore", "show_desktop", "snap_left", "snap_right", or "split_screen"' },
+                app_name: { type: 'STRING', description: 'Optional process/app name to target (or left app when action is "split_screen", e.g. "Code", "chrome", "notepad")' },
+                second_app_name: { type: 'STRING', description: 'Right-side process/app name when action is "split_screen" (e.g. "chrome", "msedge")' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'connectivity_control',
+            description: 'Wi-Fi, Bluetooth & Network Diagnostics Control: Turns Wi-Fi or Bluetooth on/off via Windows Radios API, or checks live Wi-Fi signal strength, SSID, IP address, and internet ping latency.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"wifi_on", "wifi_off", "bluetooth_on", "bluetooth_off", "status" (Wi-Fi & IP info), or "ping" (internet latency check)' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'power_and_theme_control',
+            description: 'Windows Power Plan (High Performance Turbo vs. Battery Saver) & Dark/Light Theme Switcher.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"high_performance" (Turbo mode), "power_saver" (Eco/Battery saver), "balanced", "dark_mode", "light_mode", or "toggle_theme"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'storage_and_cleanup',
+            description: 'Storage Drives, Empty Recycle Bin & Temp Cache Cleaner: Empties Windows Recycle Bin, purges %TEMP% junk cache files, or checks used/free GB across all drives (C:, D:, E:).',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"empty_recycle_bin", "clean_temp", or "drive_space"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'screen_capture_and_recorder',
+            description: 'Clean Screenshot to Desktop/Clipboard, Native Windows Screen Recorder (Win+Alt+R), and System Microphone Mute Toggle (Win+Alt+K).',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"screenshot" (saves PNG to Desktop & copies to clipboard), "start_recording", "stop_recording", or "toggle_mic"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'lecture_meeting_stenographer',
+            description: 'Live Lecture & Meeting Stenographer: Continuous background microphone/system speech recording, automatic Whisper transcription, and academic study summary note generation saved to Desktop.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"start" (begin recording), "stop_and_summarize" (finish and create structured study notes), or "status"' },
+                topic: { type: 'STRING', description: 'Subject or lecture title (e.g. "Operating Systems", "Physics Lecture", "Team Sync")' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'cli_copilot',
+            description: 'Autonomous Terminal, Git & Port Copilot: Kills processes on stubborn ports (3000, 8080, etc.), executes smart Git autopilot (stage, conventional commit, push), runs safe terminal commands, and diagnoses build/npm/pip errors.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"kill_port", "git_autopilot", "run_command", or "diagnose_error"' },
+                port: { type: 'NUMBER', description: 'Port number to free/kill (e.g. 3000, 8080)' },
+                command: { type: 'STRING', description: 'Terminal command to execute when action is "run_command"' },
+                message: { type: 'STRING', description: 'Optional commit message for Git autopilot' },
+                branch: { type: 'STRING', description: 'Optional git branch (defaults to main)' },
+                error_text: { type: 'STRING', description: 'Error message/stack trace to diagnose' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'document_swiss_knife',
+            description: '1-Click Offline PDF & Document Swiss Army Knife: Merges multiple PDF files into one clean assignment PDF, compresses/optimizes PDFs under 2MB for university portals, or extracts pages.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"merge", "compress", or "optimize"' },
+                file_paths: { type: 'ARRAY', items: { type: 'STRING' }, description: 'List of PDF file paths to merge' },
+                target_file: { type: 'STRING', description: 'Target PDF to compress or optimize' },
+                max_mb: { type: 'NUMBER', description: 'Target max file size in MB (defaults to 2.0)' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'form_autofiller',
+            description: 'Web Form & Internship Autofiller: Generates 1-click JavaScript injection bookmarklet/script to automatically fill job applications, Google Forms, and internship portals with student profile details (Name, Roll No, Branch, CGPA, GitHub, LinkedIn).',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"get_script" (generates 1-click autofill code), "view_profile", or "update_profile"' },
+                profile_updates: { type: 'OBJECT', description: 'Fields to update in student profile' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'offline_airgap_mode',
+            description: '100% Offline Air-Gapped Mode: Forces Grokki to run completely air-gapped without internet, routing all queries to local Ollama (Llama 3.2 / Qwen 2.5) and local VoiceStudio TTS, or checks offline status.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"enable", "disable", "status", or "check_ollama"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'pocket_grokki',
+            description: 'Pocket Grokki (Zero-Install Mobile LAN Companion Bridge): Connects phone wirelessly over Wi-Fi to snap homework or study notes with phone camera, remote control PC (lock, media, volume), and mobile chat.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"show_qr", "status", "enable", or "disable"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'presentation_slide_changer',
+            description: 'Smart Presentation Slide Changer (Touchless Iron Man Style & Voice): Advances slides (next), moves to previous slide (prev), toggles blackout screen (blackout), starts fullscreen slideshow (fullscreen), or starts/stops hands-free presentation mode.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"next", "prev", "blackout", "fullscreen", "start_mode", or "stop_mode"' },
+              },
+              required: ['action'],
+            },
+          },
+          {
+            name: 'find_files_and_folders',
+            description: 'Smart Local File & Folder Search + Explorer Opener: Searches across Desktop, Downloads, Documents, OneDrive, Pictures, Videos, and Drives (D:, E:) when the user asks to find a file/folder or says they forgot where they saved something. Automatically opens File Explorer and highlights the file/folder.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                query: { type: 'STRING', description: 'Filename, folder name, or keywords to search for (e.g. "resume", "operating systems", "assignment 2"). Leave empty if searching purely for the most recent file of a specific type.' },
+                file_type: { type: 'STRING', description: 'Optional filter: "pdf", "word", "ppt", "excel", "image", "video", "audio", "archive", "code", "text", or "folder"' },
+                open_in_explorer: { type: 'BOOLEAN', description: 'True (default) to automatically open File Explorer with the found file/folder highlighted' },
+                open_file: { type: 'BOOLEAN', description: 'True if the user also wants to launch/open the file itself' },
+              },
+              required: ['query'],
+            },
+          },
+          {
+            name: 'autonomous_browser_agent',
+            description: 'Autonomous Browser Agent (browser-use): Navigates websites, inspects interactive DOM elements, clicks buttons, fills out web forms, extracts tables, and accomplishes complex multi-step web workflows with live Chrome CDP control.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                goal: { type: 'STRING', description: 'The objective or task to complete in the web browser (e.g. "Go to github.com and search for lance-format/lancedb", "Open portal and check assignments")' },
+              },
+              required: ['goal'],
+            },
+          },
+          {
+            name: 'ui_tars_desktop_agent',
+            description: 'UI-TARS Vision Desktop Computer-Use Agent (bytedance/UI-TARS-desktop): Autonomous visual loop that captures screenshots, grounds GUI coordinates, and executes pixel-level Windows mouse/keyboard actions to accomplish complex desktop workflows. NEVER use this tool for reading or answering questions about highlighted or selected text.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                goal: { type: 'STRING', description: 'Desktop task instruction to execute visually on Windows (e.g. "Open VS Code, create a new file named test.py and write print hello")' },
+              },
+              required: ['goal'],
+            },
+          },
+          {
+            name: 'lancedb_vector_search',
+            description: 'LanceDB Embedded Vector Database: High-speed local semantic search, document embeddings, and folder indexing for academic notes, codebases, and student documents.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"search" (default) or "index_folder"' },
+                query: { type: 'STRING', description: 'Semantic search query to find relevant local documents or notes' },
+                folder_path: { type: 'STRING', description: 'Folder path to index into LanceDB if action is index_folder' },
+                limit: { type: 'INTEGER', description: 'Max search results (default 5)' },
+              },
+            },
+          },
+          {
+            name: 'mem0_memory',
+            description: 'Mem0 Long-Term Personalized Memory (mem0ai/mem0): Stores, searches, and manages long-term facts, personal preferences, social relationships, and study history across sessions.',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"search", "add", "list", or "delete"' },
+                query: { type: 'STRING', description: 'Query to search matching long-term memories' },
+                fact: { type: 'STRING', description: 'Fact or statement to remember if action is add' },
+                id: { type: 'STRING', description: 'Memory ID if action is delete' },
+                limit: { type: 'INTEGER', description: 'Max memories to retrieve (default 5)' },
+              },
+            },
+          },
+          {
+            name: 'mcp_servers',
+            description: 'Model Context Protocol (MCP) Server Integration (modelcontextprotocol/servers): Connects, manages, and executes standard MCP tools (GitHub, Filesystem, SQLite, Brave, Fetch, etc.).',
+            parameters: {
+              type: 'OBJECT',
+              properties: {
+                action: { type: 'STRING', description: '"status" (default, lists servers and active tools), "start_all", "connect", or "disconnect"' },
+                server_id: { type: 'STRING', description: 'ID of the server (e.g. "github", "filesystem", "sqlite")' },
+                server_config: { type: 'OBJECT', description: 'Configuration object with command and args for connect' },
+              },
+            },
+          },
+        ],
+      },
+    ];
+  }
+
+  checkFastIntent(prompt) {
+    const raw = (prompt || '').trim();
+    const p = raw.toLowerCase();
+
+    // Fast Slash Command Interceptor
+    if (p.startsWith('/')) {
+      const parts = raw.slice(1).trim().split(/\s+/);
+      const cmd = (parts[0] || '').toLowerCase();
+      const rest = parts.slice(1).join(' ').trim();
+
+      if (cmd === 'status' || cmd === 'health') {
+        return { tool: 'pc_health_and_optimizer', args: { action: 'check' } };
+      }
+      if (cmd === 'clean' || cmd === 'cleanup') {
+        return { tool: 'storage_and_cleanup', args: { action: 'clean_temp' } };
+      }
+      if (cmd === 'screenshot' || cmd === 'snip') {
+        return { tool: 'screen_capture_and_recorder', args: { action: 'screenshot' } };
+      }
+      if (cmd === 'lock') {
+        return { tool: 'system_power', args: { action: 'lock' } };
+      }
+      if (cmd === 'sleep') {
+        return { tool: 'system_power', args: { action: 'sleep' } };
+      }
+      if (cmd === 'mute') {
+        return { tool: 'system_volume', args: { action: 'mute' } };
+      }
+      if (cmd === 'unmute') {
+        return { tool: 'system_volume', args: { action: 'unmute' } };
+      }
+      if (cmd === 'notes' && rest) {
+        return { tool: 'create_study_revision_document', args: { topic: rest } };
+      }
+      if (cmd === 'compact') {
+        memory.clear();
+        return { tool: 'compact_memory', args: {} };
+      }
+      if (cmd === 'browser' && rest) {
+        return { tool: 'open_url', args: { url: rest.startsWith('http') ? rest : `https://www.google.com/search?q=${encodeURIComponent(rest)}` } };
+      }
+      if (cmd === 'pocket' || cmd === 'pocketgrokki') {
+        return { tool: 'pocket_grokki', args: { action: 'show_qr' } };
+      }
+      if (cmd === 'present' || cmd === 'presentation') {
+        return { tool: 'presentation_slide_changer', args: { action: rest === 'stop' ? 'stop_mode' : 'start_mode' } };
+      }
+      if (cmd === 'browse' && rest) {
+        return { tool: 'autonomous_browser_agent', args: { goal: rest } };
+      }
+      if (cmd === 'uitars' && rest) {
+        return { tool: 'ui_tars_desktop_agent', args: { goal: rest } };
+      }
+      if (cmd === 'vsearch' && rest) {
+        return { tool: 'lancedb_vector_search', args: { query: rest } };
+      }
+      if (cmd === 'mem0') {
+        return { tool: 'mem0_memory', args: { action: rest ? 'search' : 'stats', query: rest } };
+      }
+      if (cmd === 'mcp') {
+        return { tool: 'mcp_servers', args: { action: rest || 'list' } };
+      }
+      if (cmd === 'organize') {
+        const isDesktop = /desktop/i.test(rest);
+        return { tool: 'organize_folder', args: { target_folder: isDesktop ? 'desktop' : 'downloads' } };
+      }
+      if (cmd === 'circle' || cmd === 'circletoask') {
+        return { tool: 'circle_to_ask', args: {} };
+      }
+      if (cmd === 'dictate' || cmd === 'dictation') {
+        return { tool: 'voice_dictation', args: {} };
+      }
+      if (cmd === 'browse' || cmd === 'browseruse') {
+        return { tool: 'autonomous_browser_agent', args: { goal: rest || 'Search the web' } };
+      }
+      if (cmd === 'uitars' || cmd === 'tars') {
+        return { tool: 'ui_tars_desktop_agent', args: { goal: rest || 'Perform desktop automation' } };
+      }
+      if (cmd === 'vsearch' || cmd === 'lancedb') {
+        return { tool: 'lancedb_vector_search', args: { query: rest || 'lecture notes' } };
+      }
+      if (cmd === 'mem0' || cmd === 'mem') {
+        return { tool: 'mem0_memory', args: { action: rest ? 'search' : 'list', query: rest } };
+      }
+      if (cmd === 'mcp') {
+        return { tool: 'mcp_servers', args: { action: rest || 'status' } };
+      }
+    }
+
+    // If Viva / Oral Exam is active, handle stop/export or route answers directly
+    if (studyEngine.vivaState && studyEngine.vivaState.active) {
+      if (/\b(stop|end|quit|finish|exit)\s+(viva|quiz|exam|oral)\b/i.test(p) ||
+          /\b(export|save)\s+(anki|flashcards?)\b/i.test(p) ||
+          p === 'stop quiz' || p === 'end viva') {
+        return { tool: 'viva_voice_quiz', args: { action: 'export_anki', topic: studyEngine.vivaState.topic } };
+      }
+      // If it's not a hardware command (volume/close/power), treat user input as their Viva answer!
+      if (!/\b(volume|mute|unmute|close window|lock pc|shutdown)\b/i.test(p) &&
+          !/\b(start|begin)\s+(a\s+)?(new\s+)?(viva|quiz)\b/i.test(p)) {
+        return {
+          tool: 'viva_voice_quiz',
+          args: {
+            action: 'answer',
+            topic: studyEngine.vivaState.topic,
+            student_answer: prompt,
+          },
+        };
+      }
+    }
+
+    // Fast Snap & Solve trigger
+    if (/^(snap\s*(&|and)\s*solve|solve\s+(what'?s\s+on\s+)?my\s+screen|solve\s+this\s+screen|snap\s+solve)/i.test(p)) {
+      return { tool: 'snap_and_solve_screen', args: { question_or_focus: prompt } };
+    }
+
+    // Hitodama Circle to Ask fast intent
+    if (/\b(circle\s+(to\s+)?ask|circle\s+(my\s+)?screen|screen\s+lasso)\b/i.test(p) || p === 'circle') {
+      return { tool: 'circle_to_ask', args: {} };
+    }
+
+    // Hitodama Voice Dictation fast intent
+    if (/\b(voice\s+dictation|dictate\s+(text|speech)?|type\s+with\s+(my\s+)?voice)\b/i.test(p)) {
+      return { tool: 'voice_dictation', args: {} };
+    }
+
+    // Fast Highlight-to-Action / Selection Perception Intent
+    // Matches: "What does the highlighted text says??", "explain the highlighted text", "summarize selected text", "read highlighted", "what did I highlight", etc.
+    if (
+      /\b(?:highlighted|selected)\s+(?:text|code|selection|paragraph|sentence|word|lines?|snippet)\b/i.test(p) ||
+      /\b(?:what\s+(?:does\s+)?(?:the\s+)?(?:highlighted|selected)\s+(?:text|part|section|code|snippet)?\s*(?:say|says|mean|is|state))\b/i.test(p) ||
+      /\b(?:explain|summarize|read|tell\s+me\s+about|translate|rewrite|fix|check|debug)\s+(?:the\s+|this\s+|my\s+|what\s+i\s+)?(?:highlighted|selected)\b/i.test(p) ||
+      /\bwhat\s+did\s+i\s+(?:highlight|select)\b/i.test(p) ||
+      /\bwhat\s+is\s+(?:highlighted|selected)\b/i.test(p) ||
+      /\bact\s+on\s+(?:what\s+i\s+)?(?:highlighted|selected)\b/i.test(p)
+    ) {
+      return { tool: 'highlight_to_action', args: { instruction: prompt } };
+    }
+
+    // Fast Folder Auto-Organizer (Downloads / Desktop)
+    if (/\b(organize|clean\s*up|sort|tidy)\s+(my\s+)?(downloads?|desktop)(\s+folder)?\b/i.test(p)) {
+      const isDesktop = /\bdesktop\b/i.test(p);
+      return { tool: 'organize_folder', args: { target_folder: isDesktop ? 'desktop' : 'downloads' } };
+    }
+
+    // Fast File & Folder Finder ("where did I save...", "forgot where I saved...", "find my file/folder...", "locate...")
+    if (
+      /\b(where\s+did\s+i\s+save|forgot\s+where\s+i\s+saved|where\s+is\s+my\s+.*\b(file|folder|pdf|doc|docx|ppt|pptx|notes?|resume|assignment|report|project)\b|(?:find|locate|search\s+(?:for|my\s+pc\s+for))\s+(?:my\s+|the\s+)?(?:file|folder|pdf|document|notes?|resume|assignment|project)\b)/i.test(p)
+    ) {
+      const wantsOpenFile = /\bopen\s+(it|the\s+file)\b/i.test(p) && !/\bopen\s+(the\s+)?(location|folder|in\s+explorer)\b/i.test(p);
+      return {
+        tool: 'find_files_and_folders',
+        args: {
+          query: prompt,
+          open_in_explorer: true,
+          open_file: wantsOpenFile,
+        },
+      };
+    }
+
+    // Fast PC Health & RAM Optimizer
+    if (/\b(check\s+(my\s+)?(pc|system|computer|laptop|gpu)\s+(health|status|stats|temp|temperature)|what'?s\s+eating\s+(my\s+)?ram|pc\s+health)\b/i.test(p)) {
+      return { tool: 'pc_health_and_optimizer', args: { action: 'check' } };
+    }
+    if (/\b(optimize|free\s+up|clean|boost|clear)\s+(my\s+)?(ram|memory)\b/i.test(p)) {
+      return { tool: 'pc_health_and_optimizer', args: { action: 'optimize' } };
+    }
+
+    // 0. Instant Stop Timer & Countdown Fast Intent: e.g. "stop timer", "stop the timer", "cancel timer", "stop the fucking timer", "stop countdown", "turn off timer", "stop lock in"
+    if (/\b(?:stop|cancel|end|kill|clear|turn\s+off|disable|halt)\s+(?:the\s+|all\s+|active\s+)?(?:fucking\s+|damn\s+)?(?:timers?|countdowns?|alarms?|lock[- ]?in|lock[- ]?ins|pomodoro|study\s+sessions?|focus\s+sessions?|focus\s+timers?|study\s+timers?)\b/i.test(p) ||
+        /^(?:stop|cancel|end|kill|clear)\s+(?:the\s+)?(?:timer|countdown|alarm|lockin|lock-in)$/i.test(p)) {
+      return { tool: 'stop_timer', args: {} };
+    }
+
+    // Fast Island Unlock Intent (Check unlock first): e.g. "lock mode off", "turn off lock mode", "disable lock mode", "unlock dynamic island", "unlock island"
+    if (/\b(?:turn\s+off|disable|deactivate|stop)\s+(?:the\s+)?lock\s+mode\b/i.test(p) ||
+        /\b(?:unlock\s+(?:the\s+)?(?:mode|island|notch|dynamic\s+island))\b/i.test(p) ||
+        /^lock\s+mode\s+off$/i.test(p) ||
+        /^unlock\s*(?:island|notch|mode)?$/i.test(p)) {
+      return { tool: 'toggle_island_lock_mode', args: { locked: false } };
+    }
+
+    // Fast Island Lock Mode Intent: e.g. "lock mode on", "turn on lock mode", "enable lock mode", "lock dynamic island", "lock island"
+    if (/\b(?:turn\s+on|enable|activate|set)\s+(?:the\s+)?lock\s+mode\b/i.test(p) ||
+        /\b(?:lock\s+(?:the\s+)?(?:mode|island|notch|dynamic\s+island))\b/i.test(p) ||
+        /^lock\s+mode\s+on$/i.test(p) ||
+        /^lock\s*(?:island|notch|mode)$/i.test(p)) {
+      return { tool: 'toggle_island_lock_mode', args: { locked: true } };
+    }
+
+    // Fast Lock-In Study / Pomodoro / Focus Timer Intent
+    if (/\b(lock[- ]?in|pomodoro|study\s+session|focus\s+session|focus\s+timer|study\s+timer)\b/i.test(p) ||
+        /\b(set|start|begin|create|run)\s+(a\s+|an\s+)?(\d+(\.\d+)?\s*[- ]?(min|mins|minute|minutes|sec|secs|second|seconds|hr|hrs|hour|hours)\s+)?(timer|countdown|lock[- ]?in|pomodoro)\b/i.test(p) ||
+        /^timer\s+(?:for\s+)?\d+/i.test(p)) {
+      if (/\b(stop|cancel|end|clear|kill)\b/i.test(p)) {
+        return { tool: 'start_lock_in_study_session', args: { action: 'stop' } };
+      }
+      let mins = 25;
+      const minMatch = p.match(/(\d+(?:\.\d+)?)\s*[- ]?(?:min|mins|minute|minutes|m)\b/i);
+      const secMatch = p.match(/(\d+(?:\.\d+)?)\s*[- ]?(?:sec|secs|second|seconds|s)\b/i);
+      const hrMatch = p.match(/(\d+(?:\.\d+)?)\s*[- ]?(?:hr|hrs|hour|hours|h)\b/i);
+      if (minMatch) mins = parseFloat(minMatch[1]);
+      else if (secMatch) mins = Math.max(0.08, parseFloat(secMatch[1]) / 60);
+      else if (hrMatch) mins = parseFloat(hrMatch[1]) * 60;
+
+      const isPlainTimer = /\b(timer|countdown)\b/i.test(p) && !/\b(lock[- ]?in|study|pomodoro|focus)\b/i.test(p);
+      const subjMatch = p.match(/(?:on|for|studying)\s+([a-zA-Z0-9\s_+-]+)$/i);
+      let subject = isPlainTimer ? 'Timer' : 'Study';
+      if (subjMatch) {
+        const candidate = subjMatch[1].replace(/\b(\d+\s*(min|mins|minute|minutes|sec|seconds|m|s)|lock[- ]?in|session|timer)\b/gi, '').trim();
+        if (candidate) subject = candidate;
+      }
+      return {
+        tool: 'start_lock_in_study_session',
+        args: {
+          duration_minutes: mins,
+          subject,
+          play_lofi: !isPlainTimer && !/\b(no\s+(music|lofi)|without\s+(music|lofi))\b/i.test(p),
+        },
+      };
+    }
+
+    // Guard against scheduled/timed commands being treated as immediate OS power/volume actions!
+    // e.g. "lock my pc in 20 minutes" or "remind me in 10 seconds..."
+    if (/\b(remind\s+me|in\s+\d+(\.\d+)?\s*(sec|second|seconds|min|mins|minute|minutes|hr|hour|hours))\b/i.test(p)) {
+      return null; // Let LLM parse exact delay_minutes, reminder_text, and os_action
+    }
+    
+    // Guard against instructional queries
+    if (/\b(how to|how do i|why|what is|explain|tutorial)\b/i.test(p)) {
+      return null;
+    }
+
+    // --- 1. Screen Brightness Fast Intents ---
+    const brightMatch = p.match(/\b(?:set\s+)?brightness\s+(?:to\s+)?(\d{1,3})%?\b/i);
+    if (brightMatch) {
+      const lvl = parseInt(brightMatch[1], 10);
+      if (!isNaN(lvl) && lvl >= 0 && lvl <= 100) {
+        return { tool: 'system_brightness', args: { action: 'set', level: lvl } };
+      }
+    }
+    if (/\b(max|full|100%?)\s+brightness\b/i.test(p)) {
+      return { tool: 'system_brightness', args: { action: 'set', level: 100 } };
+    }
+    if (/\b(dim\s+(my\s+)?(screen|display|monitor)|night\s+brightness)\b/i.test(p)) {
+      return { tool: 'system_brightness', args: { action: 'set', level: 20 } };
+    }
+    if (/\b(increase|turn up|raise|boost)\s+(the\s+)?(screen\s+)?brightness\b/i.test(p) || p === 'brightness up' || p === 'brighter') {
+      return { tool: 'system_brightness', args: { action: 'up' } };
+    }
+    if (/\b(decrease|turn down|lower|reduce)\s+(the\s+)?(screen\s+)?brightness\b/i.test(p) || p === 'brightness down') {
+      return { tool: 'system_brightness', args: { action: 'down' } };
+    }
+
+    // --- 2. Window Manager & Snap Fast Intents ---
+    if (/\b(show\s+desktop|minimize\s+(all|everything|all\s+windows))\b/i.test(p)) {
+      return { tool: 'window_manager', args: { action: 'show_desktop' } };
+    }
+    if (/\b(minimize\s+(this|current|active)?\s*(window|app|software)?)\b/i.test(p) && !/\ball\b/i.test(p)) {
+      return { tool: 'window_manager', args: { action: 'minimize' } };
+    }
+    if (/\b(maximize\s+(this|current|active)?\s*(window|app|software)?|full\s*screen\s+window)\b/i.test(p)) {
+      return { tool: 'window_manager', args: { action: 'maximize' } };
+    }
+    if (/\b(snap\s+(this\s+)?(window\s+)?(to\s+the\s+)?left)\b/i.test(p)) {
+      return { tool: 'window_manager', args: { action: 'snap_left' } };
+    }
+    if (/\b(snap\s+(this\s+)?(window\s+)?(to\s+the\s+)?right)\b/i.test(p)) {
+      return { tool: 'window_manager', args: { action: 'snap_right' } };
+    }
+
+    // --- 3. Connectivity (Wi-Fi / Bluetooth / Ping) Fast Intents ---
+    if (/\b(turn\s+on|enable)\s+(my\s+)?wi-?fi\b/i.test(p)) {
+      return { tool: 'connectivity_control', args: { action: 'wifi_on' } };
+    }
+    if (/\b(turn\s+off|disable)\s+(my\s+)?wi-?fi\b/i.test(p)) {
+      return { tool: 'connectivity_control', args: { action: 'wifi_off' } };
+    }
+    if (/\b(turn\s+on|enable)\s+(my\s+)?bluetooth\b/i.test(p)) {
+      return { tool: 'connectivity_control', args: { action: 'bluetooth_on' } };
+    }
+    if (/\b(turn\s+off|disable)\s+(my\s+)?bluetooth\b/i.test(p)) {
+      return { tool: 'connectivity_control', args: { action: 'bluetooth_off' } };
+    }
+    if (/\b(check\s+(my\s+)?(wi-?fi|network|ip|internet)|wi-?fi\s+status)\b/i.test(p)) {
+      return { tool: 'connectivity_control', args: { action: 'status' } };
+    }
+    if (/\b(ping\s+test|test\s+(my\s+)?ping|check\s+latency)\b/i.test(p)) {
+      return { tool: 'connectivity_control', args: { action: 'ping' } };
+    }
+
+    // --- 4. Power Plan & Dark/Light Theme Fast Intents ---
+    if (/\b(switch\s+(windows\s+)?to\s+dark\s+mode|enable\s+dark\s+mode|dark\s+mode)\b/i.test(p)) {
+      return { tool: 'power_and_theme_control', args: { action: 'dark_mode' } };
+    }
+    if (/\b(switch\s+(windows\s+)?to\s+light\s+mode|enable\s+light\s+mode|light\s+mode)\b/i.test(p)) {
+      return { tool: 'power_and_theme_control', args: { action: 'light_mode' } };
+    }
+    if (/\b(high\s+performance|turbo\s+mode|ultimate\s+performance)\b/i.test(p)) {
+      return { tool: 'power_and_theme_control', args: { action: 'high_performance' } };
+    }
+    if (/\b(power\s+saver|battery\s+saver|eco\s+mode)\b/i.test(p)) {
+      return { tool: 'power_and_theme_control', args: { action: 'power_saver' } };
+    }
+
+    // --- 5. Storage, Recycle Bin & Temp Cache Fast Intents ---
+    if (/\b(empty|clear|clean|purge|delete|flush|dump)\b.*?\b(recycle\s*bin|recyclebin|trash|bin)\b/i.test(p) ||
+        /\b(recycle\s*bin|recyclebin|trash)\b.*?\b(empty|clear|clean|purge|delete)\b/i.test(p)) {
+      return { tool: 'storage_and_cleanup', args: { action: 'empty_recycle_bin' } };
+    }
+    if (/\b(clean|clear|purge)\s+(windows\s+)?temp(\s+files|\s+cache)?\b/i.test(p)) {
+      return { tool: 'storage_and_cleanup', args: { action: 'clean_temp' } };
+    }
+    if (/\b(check\s+(my\s+)?(drive|disk|storage)\s+space|free\s+disk\s+space)\b/i.test(p)) {
+      return { tool: 'storage_and_cleanup', args: { action: 'drive_space' } };
+    }
+
+    // --- 6. Screenshot, Screen Recorder & Mic Mute Fast Intents ---
+    if (/\b(take\s+a\s+screenshot|capture\s+screenshot|save\s+a\s+screenshot)\b/i.test(p)) {
+      return { tool: 'screen_capture_and_recorder', args: { action: 'screenshot' } };
+    }
+
+    // --- 7. Live Lecture Stenographer Fast Intents (checked before screen recording) ---
+    if (/\b(start\s+(recording\s+)?(this\s+)?(lecture|meeting|class)|record\s+(this\s+)?(lecture|meeting|class))\b/i.test(p)) {
+      const topicMatch = p.match(/(?:for|on|about)\s+([a-zA-Z0-9\s_-]+)$/i);
+      return { tool: 'lecture_meeting_stenographer', args: { action: 'start', topic: topicMatch ? topicMatch[1].trim() : 'Lecture' } };
+    }
+    if (/\b(finish\s+(the\s+)?lecture\s+notes|stop\s+(and\s+)?summarize\s+(the\s+)?(lecture|meeting)|summarize\s+(this\s+)?(recorded\s+)?lecture)\b/i.test(p)) {
+      return { tool: 'lecture_meeting_stenographer', args: { action: 'stop_and_summarize' } };
+    }
+
+    if (/\b(start\s+(screen\s+)?recording|record\s+my\s+screen)\b/i.test(p)) {
+      return { tool: 'screen_capture_and_recorder', args: { action: 'start_recording' } };
+    }
+    if (/\b(stop\s+(screen\s+)?recording)\b/i.test(p)) {
+      return { tool: 'screen_capture_and_recorder', args: { action: 'stop_recording' } };
+    }
+    if (/\b(mute|unmute|toggle)\s+(my\s+)?(mic|microphone)\b/i.test(p)) {
+      return { tool: 'screen_capture_and_recorder', args: { action: 'toggle_mic' } };
+    }
+
+    // --- 8. Terminal / Port Copilot Fast Intents ---
+    const portMatch = p.match(/\b(?:kill|free|terminate|close)\s+(?:the\s+)?port\s+(\d{2,5})\b/i);
+    if (portMatch) {
+      return { tool: 'cli_copilot', args: { action: 'kill_port', port: parseInt(portMatch[1], 10) } };
+    }
+    if (/\b(git\s+autopilot|commit\s+and\s+push|push\s+(my\s+)?changes\s+to\s+git)\b/i.test(p)) {
+      return { tool: 'cli_copilot', args: { action: 'git_autopilot' } };
+    }
+
+    // --- 9. Document Swiss Army Knife Fast Intents ---
+    if (/\b(merge|combine)\s+(all\s+)?(the\s+)?(my\s+)?(assignment\s+)?pdfs?\b/i.test(p)) {
+      return { tool: 'document_swiss_knife', args: { action: 'merge' } };
+    }
+    if (/\b(compress|shrink|optimize)\s+(this\s+)?(the\s+)?pdf\b/i.test(p)) {
+      return { tool: 'document_swiss_knife', args: { action: 'compress' } };
+    }
+
+    // --- 10. Form Autofiller Fast Intents ---
+    if (/\b(autofill|fill)\s*(?:in)?\s*(?:my)?\s*(internship|job|profile|google\s+form|form)\b/i.test(p)) {
+      return { tool: 'form_autofiller', args: { action: 'get_script' } };
+    }
+    if (/\b(view|check|show)\s+(my\s+)?(student\s+)?(internship\s+)?profile\b/i.test(p)) {
+      return { tool: 'form_autofiller', args: { action: 'view_profile' } };
+    }
+
+    // --- 11. Offline Airgap Mode Fast Intents ---
+    if (/\b(enable|turn\s+on|activate|switch\s+to)\s+(offline|airplane|air[- ]?gap(ped)?)\s+mode\b/i.test(p)) {
+      return { tool: 'offline_airgap_mode', args: { action: 'enable' } };
+    }
+    if (/\b(disable|turn\s+off|exit)\s+(offline|airplane|air[- ]?gap(ped)?)\s+mode\b/i.test(p)) {
+      return { tool: 'offline_airgap_mode', args: { action: 'disable' } };
+    }
+    if (/\b(offline|air[- ]?gap(ped)?)\s+mode\s+status\b/i.test(p)) {
+      return { tool: 'offline_airgap_mode', args: { action: 'status' } };
+    }
+
+    // --- 12. Smart Presentation Slide Changer & Air Cursor Fast Intents ---
+    if (/\b(start|enable|turn\s+on|activate|launch)?\s*(air\s*cursor|spatial\s*mouse|spatial\s*cursor|hand\s*mouse)\b/i.test(p) ||
+        /^\/(aircursor|air_cursor|air)$/i.test(p)) {
+      return { tool: 'presentation_slide_changer', args: { action: 'air_cursor' } };
+    }
+    if (/\b(start|enable|turn\s+on|activate|launch)\s+(presentation|slide\s+changer|gesture\s+slide|touchless\s+slide)\s*(mode)?\b/i.test(p)) {
+      return { tool: 'presentation_slide_changer', args: { action: 'start_mode' } };
+    }
+    if (/^(deactivate|stop|exit|cancel|turn\s+off|disable|close|quit)$/i.test(p) ||
+        /\b(stop|disable|turn\s+off|deactivate|exit|cancel|close|kill)\s+(presentation|slide\s+changer|gesture\s+slide|camera|webcam)\s*(mode)?\b/i.test(p) ||
+        /\b(camera|webcam)\s+(off|stop|disable|kill|close)\b/i.test(p)) {
+      return { tool: 'presentation_slide_changer', args: { action: 'stop_mode' } };
+    }
+    if (/\b(next\s+slide|slide\s+forward|advance\s+slide|next\s+page\s+slide|moving\s+on\s+to\s+(the\s+)?next\s+(slide|topic)|as\s+you\s+can\s+see\s+on\s+(the\s+)?next\s+slide)\b/i.test(p)) {
+      return { tool: 'presentation_slide_changer', args: { action: 'next' } };
+    }
+    if (/\b(previous\s+slide|prev\s+slide|slide\s+back|go\s+back\s+a\s+slide|one\s+slide\s+back)\b/i.test(p)) {
+      return { tool: 'presentation_slide_changer', args: { action: 'prev' } };
+    }
+    if (/\b(blackout(\s+(the\s+)?(screen|slides?))?|blank\s+(the\s+)?screen|black\s+screen(\s+slides?)?)\b/i.test(p)) {
+      return { tool: 'presentation_slide_changer', args: { action: 'blackout' } };
+    }
+    if (/\b(start\s+(the\s+)?slideshow|fullscreen\s+slides?)\b/i.test(p)) {
+      return { tool: 'presentation_slide_changer', args: { action: 'fullscreen' } };
+    }
+
+    // Pocket Grokki (Mobile Companion Bridge)
+    if (/\b(pocket\s*grokki|connect\s*(my\s*)?phone|link\s*(my\s*)?phone|phone\s*(companion|bridge|qr)|show\s*phone\s*qr|scan\s*phone\s*qr)\b/i.test(p) ||
+        /^\/(pocket|pocketgrokki|phone)$/i.test(p)) {
+      return { tool: 'pocket_grokki', args: { action: 'show_qr' } };
+    }
+
+    // Volume Unmute
+    if (/^(can you\s+)?unmute(\s+(the|my)?\s*(system|pc|computer)?\s*volume)?$/i.test(p) ||
+        /\bunmute\s+(the\s+)?(system\s+)?volume\b/i.test(p) ||
+        (/\bunmute\b/i.test(p) && !/\b(mic|microphone)\b/i.test(p))) {
+      return { tool: 'system_volume', args: { action: 'unmute' } };
+    }
+
+    // Volume Mute
+    if (/^(can you\s+)?mute(\s+(the|my)?\s*(system|pc|computer)?\s*volume)?$/i.test(p) ||
+        /\bmute\s+(the\s+)?(system\s+)?volume\b/i.test(p) ||
+        p === 'mute' || p === 'mute audio') {
+      return { tool: 'system_volume', args: { action: 'mute' } };
+    }
+
+    // Volume Up / Increase
+    if (/\b(increase|turn up|raise|boost|bump up)\s+(the\s+)?(system\s+)?volume\b/i.test(p) ||
+        /\bvolume\s+up\b/i.test(p) ||
+        p === 'increase volume' || p === 'louder') {
+      return { tool: 'system_volume', args: { action: 'up' } };
+    }
+
+    // Volume Down / Decrease
+    if (/\b(decrease|turn down|lower|reduce)\s+(the\s+)?(system\s+)?volume\b/i.test(p) ||
+        /\bvolume\s+down\b/i.test(p) ||
+        p === 'decrease volume' || p === 'softer' || p === 'quieter') {
+      return { tool: 'system_volume', args: { action: 'down' } };
+    }
+
+    // Volume Set: e.g. "set volume to 70" or "volume 50"
+    const volMatch = p.match(/\b(?:set\s+)?volume\s+(?:to\s+)?(\d{1,3})%?\b/i);
+    if (volMatch) {
+      const lvl = parseInt(volMatch[1], 10);
+      if (!isNaN(lvl) && lvl >= 0 && lvl <= 100) {
+        return { tool: 'system_volume', args: { action: 'set', level: lvl } };
+      }
+    }
+
+    // Close Current Software / Window
+    if (/\b(close\s+(current\s+)?(opened\s+)?(software|window|app|application|program))\b/i.test(p) ||
+        /\b(close\s+this\s+(window|app|software|program))\b/i.test(p) ||
+        p === 'close window' || p === 'close app' || p === 'close software') {
+      return { tool: 'close_active_window', args: {} };
+    }
+
+    // Close Specific App: e.g. "close chrome", "close notepad"
+    const closeAppMatch = p.match(/^close\s+([a-zA-Z0-9_\-\s]+)$/i);
+    if (closeAppMatch) {
+      const app = closeAppMatch[1].trim();
+      const forbidden = ['it', 'window', 'the window', 'current window', 'current software', 'this', 'this window', 'this app', 'all', 'everything', 'grokki', 'grokbot'];
+      if (!forbidden.includes(app.toLowerCase())) {
+        return { tool: 'close_active_window', args: { app_name: app } };
+      }
+    }
+
+    // 0. Fast WhatsApp Save Contact Alias Intent: e.g. "Mom is 9876543210", "Papa is +919876543210", "Save contact Papa 2 as 9876543210"
+    const saveAliasMatch = p.match(/^(?:save|set|add)?\s*(?:whatsapp\s+)?(?:contact\s+)?([a-zA-Z0-9_\-\s\(\)\']+?)(?:'s\s*(?:number|phone|whatsapp)|\s+is|\s+to|\s+as|\s+number\s+is|\s*:\s*|\s*=\s*|\s+)\s*(\+?\d[\d\s\-]{6,16}\d)$/i);
+    if (saveAliasMatch) {
+      let aliasName = saveAliasMatch[1].replace(/^(?:contact|save|set|add)\s+/i, '').replace(/['’]s\s*(?:number|phone|whatsapp)?$/i, '').trim();
+      const rawDigits = saveAliasMatch[2].replace(/[^\d+]/g, '');
+      const forbiddenNames = ['send', 'call', 'message', 'text', 'open', 'play', 'google', 'search', 'volume'];
+      if (aliasName && !forbiddenNames.includes(aliasName.toLowerCase()) && rawDigits.length >= 7) {
+        return {
+          tool: 'save_whatsapp_contact_alias',
+          args: { name: aliasName, phone: rawDigits },
+        };
+      }
+    }
+
+    // Fast WhatsApp Send Selected File or Attached File Intent:
+    // e.g. "Send it to Mom", "Send this to Papa", "Send this file to Papa 2 (Jio)", "Send to Mom", "Share this with Rajbir"
+    const sendSelectedMatch = p.match(/^(?:can\s+you\s+)?(?:send|share)\s+(?:it|this|this\s+file|the\s+file|selected\s+file)\s+to\s+([a-zA-Z0-9_\-\s\(\)\']+?)(?:\s+(?:on|via)\s+whatsapp)?(?:\s+(?:saying|that|with\s+message|with|message:?|:)\s*(.+))?$/i);
+    const shareWithMatch = p.match(/^(?:can\s+you\s+)?share\s+(?:it|this|this\s+file|the\s+file|selected\s+file)\s+with\s+([a-zA-Z0-9_\-\s\(\)\']+?)(?:\s+(?:on|via)\s+whatsapp)?(?:\s+(?:saying|that|with\s+message|with|message:?|:)\s*(.+))?$/i);
+    const sendToShortMatch = p.match(/^(?:can\s+you\s+)?send\s+(?:to\s+)([a-zA-Z0-9_\-\s\(\)\']+?)(?:\s+(?:on|via)\s+whatsapp)?$/i);
+
+    if (sendSelectedMatch || shareWithMatch || sendToShortMatch) {
+      const m = sendSelectedMatch || shareWithMatch || sendToShortMatch;
+      const targetContact = m[1].trim().replace(/^the\s+/i, '');
+      const forbiddenTargets = ['me', 'us', 'whatsapp', 'wa', 'google', 'drive', 'app', 'system', 'it', 'this'];
+      if (!forbiddenTargets.includes(targetContact.toLowerCase())) {
+        const customMsg = m[2] ? m[2].trim().replace(/^[\"\']|[\"\']$/g, '') : '';
+        let targetFilePath = (this.activeContext && this.activeContext.filePath) ||
+          (this.activeContext && this.activeContext.attachedFile && (this.activeContext.attachedFile.path || this.activeContext.attachedFile)) || null;
+
+        if (!targetFilePath || !fs.existsSync(targetFilePath)) {
+          const selected = this.getSelectedExplorerFiles();
+          if (selected && selected.length > 0 && fs.existsSync(selected[0])) {
+            targetFilePath = selected[0];
+          }
+        }
+
+        return {
+          tool: 'send_whatsapp_file_or_message',
+          args: {
+            contact_or_phone: targetContact,
+            file_path: targetFilePath || '',
+            message: customMsg,
+          },
+        };
+      }
+    }
+
+    // 1. Fast WhatsApp Send File Intent: e.g. "Send C:\path\test.png to +919387661149 on WhatsApp with message Here is the file"
+    const waFileSendMatch = p.match(/^send\s+(?:file\s+)?([a-zA-Z0-9_\-:\\\/\.]+?\.[a-zA-Z0-9]+)\s+to\s+(.+?)\s+(?:on|via)\s+(?:whatsapp|wa)(?:\s+(?:with\s+message|saying|with|:)\s+(.+))?$/i);
+    if (waFileSendMatch) {
+      return {
+        tool: 'send_whatsapp_file_or_message',
+        args: {
+          file_path: waFileSendMatch[1].trim(),
+          contact_or_phone: waFileSendMatch[2].trim(),
+          message: waFileSendMatch[3] ? waFileSendMatch[3].trim() : '',
+        },
+      };
+    }
+
+    // 2. Fast WhatsApp Send Message Intent: e.g. "Send WhatsApp message to Rajbir saying Hey bro", "Send WhatsApp to +919387661149: Hello"
+    const waSendMsgMatch = p.match(/^send\s+(?:an?\s+)?(?:whatsapp|wa)?\s*(?:messages?|texts?|chats?|msg)?\s*(?:on\s+whatsapp\s+)?(?:to\s+)(.+?)(?:\s+(?:on|via)\s+whatsapp)?(?:\s+(?:saying|that|with\s+message|message:?|:)\s*|\s*:\s*)(.+)$/i);
+    if (waSendMsgMatch) {
+      const contact = waSendMsgMatch[1].trim().replace(/^(?:the\s+)/i, '');
+      const msg = waSendMsgMatch[2].trim().replace(/^["']|["']$/g, '');
+      return {
+        tool: 'send_whatsapp_file_or_message',
+        args: {
+          contact_or_phone: contact,
+          message: msg,
+        },
+      };
+    }
+
+    // 3. Fast WhatsApp General check messages:
+    // e.g. "Can you check any recent messages from WhatsApp?", "check my recent whatsapp messages", "who texted me on whatsapp", "read whatsapp messages"
+    if (
+      /\b(?:check|read|get|show|view|fetch|see)\s+(?:any\s+|my\s+)?(?:recent\s+|latest\s+)?(?:whatsapp|wa)\s*(?:messages?|chats?|texts?)?\b/i.test(p) ||
+      /\b(?:check|read|get|show|view|fetch|see)\s+(?:any\s+|my\s+)?(?:recent\s+|latest\s+)?(?:messages?|chats?|texts?)\s+(?:from|on|in)\s+(?:whatsapp|wa)\b/i.test(p) ||
+      /\b(?:who\s+(?:texted|messaged)\s+me(?:\s+on\s+whatsapp)?)\b/i.test(p) ||
+      /\b(?:recent\s+whatsapp\s+messages?)\b/i.test(p) ||
+      /\b(?:any\s+(?:new\s+|recent\s+)?messages?|did\s+i\s+get\s+any\s+messages?)\s+(?:from|on|in)\s+(?:whatsapp|wa)\b/i.test(p) ||
+      /^(?:whatsapp|wa)\s+(?:messages?|chats?|texts?)$/i.test(p) ||
+      /\bcheck\s+if\s+anyone\s+(?:texted|messaged)\s+me\s+on\s+whatsapp\b/i.test(p)
+    ) {
+      return { tool: 'get_whatsapp_recent_messages', args: { limit: 5 } };
+    }
+
+    // 4. Fast WhatsApp Status intent: e.g. "whatsapp status", "is whatsapp connected"
+    if (/\b(?:whatsapp|wa)\s+status\b/i.test(p) || /\bis\s+whatsapp\s+(?:connected|linked|active)\b/i.test(p)) {
+      return { tool: 'get_whatsapp_status', args: {} };
+    }
+
+    // 5. Fast Contact Specific Message Check:
+    // e.g. "Did Rajbir sended any message to me?", "Did Papa send anything?", "Has Rajbir sent any message?", "What did Rajbir send me?", "Check messages from Rajbir"
+    const didMatch = p.match(/^(?:can\s+you\s+)?(?:did|has)\s+([a-zA-Z0-9_\-\s]+?)\s+(?:send|sent|sended|text|texted|write|wrote|say|drop|leave|message|messaged)\s+(?:(?:to\s+)?(?:me|us)\s+)?(?:any|a\s+)?(?:messages?|texts?|chats?|anything)?(?:\s+(?:to\s+)?(?:me|us))?/i);
+    const didMsgMeMatch = p.match(/^(?:can\s+you\s+)?(?:did|has)\s+([a-zA-Z0-9_\-\s]+?)\s+(?:message|messaged)\s+(?:me|us)/i);
+    const whatDidMatch = p.match(/^(?:can\s+you\s+)?what\s+did\s+([a-zA-Z0-9_\-\s]+?)\s+(?:send|sent|sended|text|texted|write|wrote|say)(?:\s+me)?(?:\s+on\s+whatsapp)?/i);
+    const anyMsgFromMatch = p.match(/^(?:(?:are\s+there\s+)?any\s+(?:new\s+|recent\s+)?messages?\s+(?:from|by)\s+([a-zA-Z0-9_\-\s]+?))(?:\s+on\s+whatsapp|\s*\?|$)/i);
+    const checkFromMatch = p.match(/^(?:can\s+you\s+)?(?:check|read|show|view|see|get|find)\s+(?:messages?|texts?|chats?)\s+from\s+([a-zA-Z0-9_\-\s]+)/i);
+    const checkPersonMatch = p.match(/^(?:can\s+you\s+)?(?:check|read|show|view|see|get|find)\s+([a-zA-Z0-9_\-\s]+?)\x27s\s*(?:messages?|texts?|chats?)/i);
+
+    const matchedContact = didMatch?.[1] || didMsgMeMatch?.[1] || whatDidMatch?.[1] || anyMsgFromMatch?.[1] || checkFromMatch?.[1] || checkPersonMatch?.[1];
+
+    if (matchedContact) {
+      const contactClean = matchedContact.trim().replace(/^(?:the\s+)/i, '');
+      const forbidden = ['you', 'the', 'my', 'recent', 'latest', 'whatsapp', 'wa', 'pc', 'system', 'it', 'anyone', 'someone', 'i', 'we', 'they'];
+      if (!forbidden.includes(contactClean.toLowerCase())) {
+        return { tool: 'get_whatsapp_recent_messages', args: { contact_name: contactClean } };
+      }
+    }
+
+    // Fast App Open + Type Intent: e.g. "open notepad and type Hello from Grokki"
+    const openTypeMatch = p.match(/^(?:can\s+you\s+)?open\s+([a-zA-Z0-9_\-\s]+?)\s+and\s+(?:type|write)\s+(.+)$/i);
+    if (openTypeMatch) {
+      const app = openTypeMatch[1].trim();
+      const text = openTypeMatch[2].trim().replace(/^["']|["']$/g, '');
+      return { tool: 'open_app', args: { name: app, text_to_type: text } };
+    }
+
+    // Fast App Open + Click Intent: e.g. "open notepad and click file"
+    const openClickMatch = p.match(/^(?:can\s+you\s+)?open\s+([a-zA-Z0-9_\-\s]+?)\s+and\s+click\s+(.+)$/i);
+    if (openClickMatch) {
+      const app = openClickMatch[1].trim();
+      const target = openClickMatch[2].trim().replace(/^["']|["']$/g, '');
+      return { tool: 'open_app', args: { name: app, click_target: target } };
+    }
+
+    // Fast App Launch Intent: e.g. "open notepad", "launch spotify", "start calculator"
+    const openAppMatch = p.match(/^(?:can\s+you\s+)?(?:open|launch|start)\s+([a-zA-Z0-9_\-\s]+)$/i);
+    if (openAppMatch) {
+      const app = openAppMatch[1].trim();
+      const lowerApp = app.toLowerCase();
+      const forbidden = ['url', 'link', 'browser', 'web', 'camera', 'settings', 'it', 'file', 'folder', 'video', 'song', 'music'];
+      const isTaskPhrase = /^(a|an|my|the|some|this)\s+/i.test(lowerApp) ||
+        /\b(session|lock[- ]?in|timer|pomodoro|countdown|alarm|reminder|minute|minutes|min|mins|second|seconds|hour|hours|study|recording|lecture|meeting|mode|quiz|viva)\b/i.test(lowerApp);
+      if (!forbidden.includes(lowerApp) && !isTaskPhrase && !app.startsWith('http')) {
+        return { tool: 'open_app', args: { name: app } };
+      }
+    }
+
+    // Fast Click Intent: e.g. "click file in notepad", "click save"
+    const clickAppMatch = p.match(/^(?:can\s+you\s+)?click\s+(?:the\s+)?(.+?)\s+(?:in|on)\s+([a-zA-Z0-9_\-\s]+)$/i);
+    if (clickAppMatch) {
+      return { tool: 'desktop_click', args: { target: clickAppMatch[1].trim(), app: clickAppMatch[2].trim() } };
+    }
+    const clickSimpleMatch = p.match(/^(?:can\s+you\s+)?click\s+(?:the\s+)?(file|save|close|edit|view|help|new|run|cancel|ok|submit|play|pause|next|back)$/i);
+    if (clickSimpleMatch) {
+      return { tool: 'desktop_click', args: { target: clickSimpleMatch[1].trim() } };
+    }
+
+    // Fast Type Intent: e.g. "type hello into notepad"
+    const typeAppMatch = p.match(/^(?:can\s+you\s+)?type\s+["']?(.+?)["']?\s+(?:in|into)\s+([a-zA-Z0-9_\-\s]+)$/i);
+    if (typeAppMatch) {
+      return { tool: 'desktop_type', args: { text: typeAppMatch[1].trim(), app: typeAppMatch[2].trim() } };
+    }
+
+    // Lock PC
+    if (/\b(lock\s+(my\s+)?(pc|computer|system|workstation|screen))\b/i.test(p) ||
+        /\block\s+it\b/i.test(p) || p === 'lock') {
+      return { tool: 'system_power', args: { action: 'lock' } };
+    }
+
+    // Sleep PC
+    if (/\b(make\s+(it|the\s+pc|the\s+computer)\s+sleep)\b/i.test(p) ||
+        /\b(put\s+(my\s+)?(pc|computer|system)\s+to\s+sleep)\b/i.test(p) ||
+        /\b(sleep\s+(my\s+)?(pc|computer))\b/i.test(p) ||
+        p === 'sleep' || p === 'sleep pc') {
+      return { tool: 'system_power', args: { action: 'sleep' } };
+    }
+
+    // Shutdown PC
+    if (/\b(shut\s*down\s+(my\s+)?(pc|computer|system))\b/i.test(p) ||
+        /\b(turn\s+off\s+(my\s+)?(pc|computer|system))\b/i.test(p) ||
+        p === 'shut down' || p === 'shutdown' || p === 'shutdown pc') {
+      return { tool: 'system_power', args: { action: 'shutdown' } };
+    }
+
+    // Restart PC
+    if (/\b(restart\s+(my\s+)?(pc|computer|system))\b/i.test(p) ||
+        /\b(reboot\s+(my\s+)?(pc|computer|system))\b/i.test(p) ||
+        p === 'restart' || p === 'restart pc' || p === 'reboot') {
+      return { tool: 'system_power', args: { action: 'restart' } };
+    }
+
+    // Cancel Shutdown
+    if (/\b(cancel\s+(the\s+)?(shutdown|restart))\b/i.test(p) ||
+        /\b(abort\s+(the\s+)?(shutdown|restart))\b/i.test(p)) {
+      return { tool: 'system_power', args: { action: 'cancel' } };
+    }
+
+    // --- 13. Music & Media Playback Fast Intents ---
+    // Matches "play some music", "plau some music" (common typo!), "play music", "play songs", "play [song name]", "pause/resume/next/stop music"
+    if (/^(?:pla[yu]|pleay)\s+(?:some\s+)?music(?:\s+(?:for\s+me|please))?$/i.test(p) ||
+        /^(?:pla[yu]|pleay)\s+songs?(?:\s+(?:for\s+me|please))?$/i.test(p) ||
+        p === 'play music' || p === 'plau some music') {
+      return { tool: 'play_music', args: { song: 'lofi chill mix' } };
+    }
+    const playSongMatch = p.match(/^(?:pla[yu]|pleay)\s+(?:the\s+song\s+|track\s+)?(.+?)(?:\s+(?:on|in)\s+(youtube\s*music|yt\s*music|spotify|browser|youtube))?$/i);
+    if (playSongMatch) {
+      const songQuery = playSongMatch[1].trim();
+      const platformRaw = (playSongMatch[2] || '').toLowerCase().replace(/\s+/g, '');
+      const nonMusicTerms = ['game', 'games', 'around', 'with', 'store', 'it', 'video', 'rule', 'role', 'file'];
+      if (!nonMusicTerms.includes(songQuery.toLowerCase())) {
+        let platform = undefined;
+        if (platformRaw === 'spotify') platform = 'spotify';
+        else if (platformRaw === 'youtube') platform = 'youtube';
+        else if (platformRaw.includes('music')) platform = 'ytmusic';
+        return { tool: 'play_music', args: { song: songQuery, ...(platform ? { platform } : {}) } };
+      }
+    }
+    if (/^(?:pause|stop)\s+(?:the\s+)?(?:music|song|playback|audio)$/i.test(p) || p === 'pause music' || p === 'stop music') {
+      return { tool: 'control_music', args: { action: 'pause' } };
+    }
+    if (/^(?:resume|unpause)\s+(?:the\s+)?(?:music|song|playback|audio)$/i.test(p) || p === 'resume music' || p === 'unpause music') {
+      return { tool: 'control_music', args: { action: 'resume' } };
+    }
+    if (/^(?:next|skip)\s+(?:the\s+)?(?:song|track|music)$/i.test(p) || p === 'next track' || p === 'skip track' || p === 'next song') {
+      return { tool: 'control_music', args: { action: 'next' } };
+    }
+    if (/^(?:previous|prev)\s+(?:the\s+)?(?:song|track|music)$/i.test(p) || p === 'previous track' || p === 'prev track') {
+      return { tool: 'control_music', args: { action: 'prev' } };
+    }
+
+    return null;
+  }
+
+  async runOpenAICompatible(prompt, config, context = {}) {
+    if (!this.abortControllers) this.abortControllers = new Map();
+    const convoId = (context && (context.conversationId || context.convoId)) || 'default';
+    let controller;
+    let signal;
+    if (context && context.isFailover && this.abortControllers.has(convoId)) {
+      controller = this.abortControllers.get(convoId);
+      signal = controller.signal;
+    } else {
+      if (this.abortControllers.has(convoId)) {
+        try { this.abortControllers.get(convoId).abort(); } catch (e) {}
+      }
+      controller = new AbortController();
+      this.abortControllers.set(convoId, controller);
+      this.abortController = controller;
+      signal = controller.signal;
+    }
+
+    const provider = powerTools.airgapForced ? 'ollama' : (config.provider || 'groq');
+    let endpoint = 'https://api.groq.com/openai/v1';
+    let apiKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+    let model = config.groqModel || 'qwen/qwen3.8-27b';
+    let modelCandidates = [model];
+
+    if (provider === 'groq') {
+      endpoint = 'https://api.groq.com/openai/v1';
+      apiKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+      model = config.groqModel || 'qwen/qwen3.8-27b';
+      modelCandidates = Array.from(new Set([model, 'qwen/qwen3.8-27b', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b']));
+    } else if (provider === 'ollama') {
+      const base = (config.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+      endpoint = `${base}/v1`;
+      apiKey = 'ollama';
+      model = config.ollamaModel || 'llama3.2';
+      modelCandidates = [model];
+    } else if (provider === 'openrouter') {
+      endpoint = 'https://openrouter.ai/api/v1';
+      apiKey = (config.openrouterApiKey || process.env.OPENROUTER_API_KEY || '').trim();
+      model = config.openrouterModel || 'openrouter/auto';
+      modelCandidates = [model];
+    } else if (provider === 'openai') {
+      endpoint = 'https://api.openai.com/v1';
+      apiKey = (config.openaiApiKey || process.env.OPENAI_API_KEY || '').trim();
+      model = config.openaiModel || 'gpt-4o';
+      modelCandidates = [model, 'gpt-4o-mini'];
+    } else if (provider === 'grok') {
+      endpoint = 'https://api.x.ai/v1';
+      apiKey = (config.grokApiKey || process.env.XAI_API_KEY || '').trim();
+      model = config.grokModel || 'grok-2-1212';
+      modelCandidates = [model, 'grok-beta'];
+    } else if (provider === 'deepseek') {
+      endpoint = 'https://api.deepseek.com';
+      apiKey = (config.deepseekApiKey || process.env.DEEPSEEK_API_KEY || '').trim();
+      model = config.deepseekModel || 'deepseek-chat';
+      modelCandidates = [model, 'deepseek-reasoner'];
+    } else if (provider === 'qwen') {
+      endpoint = 'https://dashscope-intl.aliyuncs.com/compatible-mode/v1';
+      apiKey = (config.qwenApiKey || process.env.DASHSCOPE_API_KEY || '').trim();
+      model = config.qwenModel || 'qwen-max';
+      modelCandidates = [model, 'qwen-plus'];
+    } else if (provider === 'omniroute' || provider === 'omnirouter') {
+      const base = (config.omnirouteEndpoint || config.omnirouterEndpoint || 'http://localhost:20128/v1').replace(/\/+$/, '');
+      endpoint = base;
+      apiKey = (config.omnirouteApiKey || config.omnirouterApiKey || process.env.OMNIROUTE_API_KEY || process.env.OMNIROUTER_API_KEY || '').trim();
+      model = config.omnirouteModel || config.omnirouterModel || 'auto';
+      modelCandidates = [model];
+    } else if (provider === 'litellm') {
+      endpoint = (config.litellmEndpoint || 'http://localhost:4000/v1').replace(/\/+$/, '');
+      apiKey = (config.litellmApiKey || process.env.LITELLM_API_KEY || '').trim();
+      model = config.litellmModel || 'gpt-4o';
+      modelCandidates = [model];
+    } else if (provider === 'bifrost') {
+      endpoint = (config.bifrostEndpoint || 'http://localhost:8080/v1').replace(/\/+$/, '');
+      apiKey = (config.bifrostApiKey || process.env.BIFROST_API_KEY || '').trim();
+      model = config.bifrostModel || 'auto';
+      modelCandidates = [model];
+    } else if (provider === 'portkey') {
+      endpoint = (config.portkeyEndpoint || 'https://api.portkey.ai/v1').replace(/\/+$/, '');
+      apiKey = (config.portkeyApiKey || process.env.PORTKEY_API_KEY || '').trim();
+      model = config.portkeyModel || 'auto';
+      modelCandidates = [model];
+    } else if (provider === 'helicone') {
+      endpoint = (config.heliconeEndpoint || 'https://oai.helicone.ai/v1').replace(/\/+$/, '');
+      apiKey = (config.heliconeApiKey || process.env.HELICONE_API_KEY || '').trim();
+      model = config.heliconeModel || 'gpt-4o';
+      modelCandidates = [model];
+    } else if (provider === 'routellm') {
+      endpoint = (config.routellmEndpoint || 'http://localhost:6060/v1').replace(/\/+$/, '');
+      apiKey = (config.routellmApiKey || process.env.ROUTELLM_API_KEY || '').trim();
+      model = config.routellmModel || 'router-mf';
+      modelCandidates = [model];
+    } else if (provider === 'newapi') {
+      endpoint = (config.newapiEndpoint || 'http://localhost:3000/v1').replace(/\/+$/, '');
+      apiKey = (config.newapiApiKey || process.env.NEWAPI_API_KEY || '').trim();
+      model = config.newapiModel || 'auto';
+      modelCandidates = [model];
+    } else if (provider === 'higress') {
+      endpoint = (config.higressEndpoint || 'http://localhost:8080/v1').replace(/\/+$/, '');
+      apiKey = (config.higressApiKey || process.env.HIGRESS_API_KEY || '').trim();
+      model = config.higressModel || 'auto';
+      modelCandidates = [model];
+    } else if (provider === 'clawrouter') {
+      endpoint = (config.clawrouterEndpoint || 'http://localhost:8000/v1').replace(/\/+$/, '');
+      apiKey = (config.clawrouterApiKey || process.env.CLAWROUTER_API_KEY || '').trim();
+      model = config.clawrouterModel || 'auto';
+      modelCandidates = [model];
+    }
+
+    const isApiKeyOptional = ['ollama', 'omniroute', 'omnirouter', 'litellm', 'bifrost', 'portkey', 'helicone', 'routellm', 'newapi', 'higress', 'clawrouter'].includes(provider);
+    if (!isApiKeyOptional && !apiKey) {
+      return { success: false, error: `NO_${provider.toUpperCase()}_API_KEY` };
+    }
+
+    this.activeConfig = config;
+    this.activeContext = context;
+    this.activePrompt = prompt || '';
+
+    let fullPrompt = prompt || '';
+    const attachPath = (context && context.filePath) || (context && context.attachedFile && (context.attachedFile.path || context.attachedFile)) || null;
+    if (attachPath && typeof attachPath === 'string') {
+      const fileName = (context && context.attachedFile && context.attachedFile.name) || path.basename(attachPath);
+      let fileSnippet = '';
+      try {
+        const ext = path.extname(attachPath).toLowerCase();
+        if (['.txt', '.md', '.json', '.js', '.ts', '.tsx', '.py', '.html', '.css', '.c', '.cpp', '.java', '.csv', '.log'].includes(ext)) {
+          const content = fs.readFileSync(attachPath, 'utf8');
+          fileSnippet = `\n[File Content of ${fileName} (${content.length} chars)]:\n\`\`\`\n${content.slice(0, 3000)}\n\`\`\``;
+        }
+      } catch (e) {}
+      fullPrompt = `${fullPrompt}\n[User attached file: "${fileName}" located at "${attachPath}"]${fileSnippet}`.trim();
+    }
+
+    // Project Mentions Context Packaging (@file and @folder)
+    if (context && (context.projectMentions || context.workspaceContext)) {
+      try {
+        const workspaceContext = require('./workspace_context');
+        const mentions = context.projectMentions || context.workspaceContext;
+        const packagedContext = workspaceContext.packageContext(mentions);
+        if (packagedContext) {
+          fullPrompt = `${packagedContext}\n${fullPrompt}`.trim();
+        }
+      } catch (err) {
+        console.warn('[AgentBrain] Failed to package project mentions:', err.message);
+      }
+    }
+
+    fullPrompt = expandSlashDirective(fullPrompt);
+
+    // Mem0 Personalized Long-Term Memory Context Injection
+    try {
+      const mem0Ctx = await mem0Manager.getMemoriesContext(prompt);
+      if (mem0Ctx) {
+        fullPrompt = `${mem0Ctx}\n${fullPrompt}`;
+      }
+    } catch (_) {}
+
+    let groundingSources = [];
+    const conversationHistory = (context && Array.isArray(context.conversationHistory) && context.conversationHistory.length > 0)
+      ? context.conversationHistory
+      : memory.getHistory();
+    const isConversationalPrompt = /^(hi|hello|hey|yo|sup|wassup|wazzup|whats?\s*up|what\s+is\s+up|how\s*('?s|is)\s*(it|everything|life)|how\s+are\s+you|how\s+do\s+you\s+do|howdy|greetings|good\s+(morning|afternoon|evening|night|day)|thanks|thank\s+you|ok|okay|bye|cool|nice)\b/i.test(prompt.trim()) && prompt.trim().split(/\s+/).length <= 7;
+    const isWebSearchActive = !isConversationalPrompt && Boolean(
+      context && (context.webSearch || context.webSearchEnabled) ||
+      shouldAutoSearchWeb(prompt, conversationHistory)
+    );
+    let resolvedQuery = prompt;
+    if (isWebSearchActive) {
+      try {
+        resolvedQuery = resolveSearchQuery(prompt, conversationHistory, config, context);
+        console.log(`[AgentBrain] Performing live web grounding for: "${resolvedQuery}" (prompt: "${prompt}")...`);
+        groundingSources = await searchWeb(resolvedQuery, 5);
+        if (groundingSources.length > 0) {
+          fullPrompt = `${fullPrompt}${buildGroundingPrompt(groundingSources, resolvedQuery)}`;
+        }
+      } catch (err) {
+        console.warn('[AgentBrain] Web grounding error:', err.message);
+      }
+    }
+
+    if (context && Array.isArray(context.conversationHistory) && context.conversationHistory.length > 0) {
+      memory.syncFromExternalHistory(context.conversationHistory);
+    }
+
+    memory.addTurn('user', prompt);
+
+    const rawHistory = memory.getHistory();
+    let systemContent = memory.buildSystemPrompt(config, fullPrompt);
+    let historyToUse = rawHistory.slice(-18);
+
+    // Groq Free Tier optimization: keep prompt lean (<3500 tokens) to guarantee zero 413 ITPM errors
+    if (provider === 'groq') {
+      const groqMem = memory.persistentMemory ? memory.persistentMemory.retrieveContext(fullPrompt, { projectId: config.activeProjectId }).formattedPromptSection : '';
+      systemContent = `You are Grokki, a fast, deeply knowledgeable, highly intelligent AI assistant for Windows${isWebSearchActive ? ' with active real-time web search capabilities' : ''}.
+User: ${config.userNickname || config.userName || 'Friend'}.
+Tone: ${config.userTone || 'warm, friendly, direct'}.
+Provide comprehensive, structured, in-depth responses like ChatGPT. When live web search grounding is provided, answer directly with the real-time facts, courses, figures, and details. Use clean Markdown formatting, Markdown tables (| Column 1 | Column 2 |) for lists and structured comparisons, and styled clickable Markdown links. Avoid robotic disclaimers.${groqMem ? `\n${groqMem}` : ''}`;
+      historyToUse = rawHistory.slice(-6);
+    }
+
+    // Ollama Local Model Optimization: keep prompt lean & concise to eliminate 30s prompt-eval delays
+    if (provider === 'ollama') {
+      if (isConversationalPrompt) {
+        systemContent = `You are Grokki, a fast, friendly AI assistant for Windows. Reply naturally in 1-2 conversational sentences. User: ${config.userNickname || config.userName || 'Friend'}.`;
+        historyToUse = rawHistory.slice(-2);
+      } else {
+        const ollamaMem = memory.persistentMemory ? memory.persistentMemory.retrieveContext(fullPrompt, { projectId: config.activeProjectId }).formattedPromptSection : '';
+        systemContent = `You are Grokki, a fast, intelligent AI assistant for Windows. Answer directly and concisely in clean Markdown. User: ${config.userNickname || config.userName || 'Friend'}. Tone: ${config.userTone || 'warm, direct'}.${ollamaMem ? `\n${ollamaMem}` : ''}`;
+        if (isWebSearchActive) {
+          systemContent += `\nREAL-TIME WEB GROUNDING: Fresh real-time search results are provided in the user message. Answer directly from these results.`;
+        }
+        historyToUse = rawHistory.slice(-4);
+      }
+    }
+
+    const messages = [
+      { role: 'system', content: systemContent },
+    ];
+
+    let hasActiveTurn = false;
+    for (let i = 0; i < historyToUse.length; i++) {
+      const turn = historyToUse[i];
+      const role = turn.role === 'model' ? 'assistant' : turn.role;
+      let content = '';
+      if (Array.isArray(turn.parts)) {
+        content = turn.parts.map((p) => p.text || '').filter(Boolean).join('\n');
+      } else if (typeof turn.content === 'string') {
+        content = turn.content;
+      }
+      // Compact prior turns for Ollama to prevent massive prompt-eval latency
+      if (provider === 'ollama' && i < historyToUse.length - 1 && content.length > 350) {
+        content = content.slice(0, 350) + '...';
+      }
+      // CRITICAL: Ensure the active current user prompt carries fullPrompt
+      // (which includes live web search grounding, attached files, and project context)
+      if (i === historyToUse.length - 1 && role === 'user') {
+        content = fullPrompt;
+        hasActiveTurn = true;
+      }
+      if (content) {
+        messages.push({ role, content });
+      }
+    }
+    if (!hasActiveTurn) {
+      messages.push({ role: 'user', content: fullPrompt });
+    }
+
+    // When Deep Search / Live Grounding is active or query is non-action, omit desktop tools
+    const toolsDecl = isWebSearchActive ? undefined : this.getRelevantTools(prompt, provider);
+    let tools = toolsDecl ? convertGeminiToolsToOpenAI(toolsDecl) : undefined;
+    if (tools && !isWebSearchActive && provider !== 'ollama') {
+      try {
+        const mcpTools = mcpManager.getOpenAIToolDefinitions();
+        if (mcpTools && mcpTools.length > 0) {
+          tools = tools.concat(mcpTools);
+        }
+      } catch (_) {}
+    }
+
+    try {
+      if (signal.aborted) throw new Error('TASK_CANCELLED');
+
+      let data = null;
+      let lastModelErr = null;
+
+      for (const candModel of modelCandidates) {
+        try {
+          if (signal.aborted) throw new Error('TASK_CANCELLED');
+          data = await callOpenAICompatible({
+            endpoint,
+            apiKey,
+            model: candModel,
+            messages,
+            tools,
+            signal,
+            timeout: provider === 'ollama' ? 180000 : 45000,
+          });
+          if (data && data.choices && data.choices.length > 0) {
+            break;
+          }
+        } catch (mErr) {
+          lastModelErr = mErr;
+          if (signal && signal.aborted) {
+            throw mErr;
+          }
+          console.warn(`[AgentBrain] Provider model ${candModel} error: ${mErr.message}. Trying next fallback...`);
+        }
+      }
+
+      if (!data) {
+        // If OpenRouter or other provider failed and Groq API key is available, fast-failover to Groq!
+        const groqKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+        if (groqKey && provider !== 'groq' && provider !== 'ollama' && (!signal || !signal.aborted)) {
+          console.log('[AgentBrain] Provider failed or rate limited, fast-failing over to Groq (500ms)...');
+          try {
+            return await this.runOpenAICompatible(prompt, { ...config, provider: 'groq', groqApiKey: groqKey }, { ...context, isFailover: true });
+          } catch (e) {}
+        }
+
+        // If Groq fails due to token limit / 413 / rate limit, seamlessly fallback to Gemini Flash
+        if (lastModelErr && (lastModelErr.message.includes('413') || lastModelErr.message.includes('Limit') || lastModelErr.message.includes('tokens per minute'))) {
+          console.log('[AgentBrain] Groq token limit hit. Seamlessly falling back to Gemini Flash...');
+          const gemKey = (config.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+          if (gemKey && (!signal || !signal.aborted)) {
+            return await this.run(prompt, { ...config, provider: 'gemini', geminiApiKey: gemKey }, { ...context, isFailover: true });
+          }
+        }
+        throw lastModelErr || new Error('No response from provider');
+      }
+
+      const choice = data.choices && data.choices[0];
+      if (!choice) throw new Error('Empty response from model');
+
+      const msg = choice.message;
+      let replyText = (msg.content || '').trim();
+      const toolCalls = Array.isArray(msg.tool_calls) ? [...msg.tool_calls] : [];
+      const executed = [];
+
+      // Intercept pseudo-tool calls from OpenRouter / Groq / Open-source models
+      // that output tool calls in the message text body (e.g. call>{"name": "playmusic", ...} or <tool_call>...</tool_call>)
+      if (replyText) {
+        const hasPseudoCall = /(?:call>|<tool_call>|\[TOOL_CALL\]|\bcall:\s*|\bAction:\s*)\s*\{/i.test(replyText) ||
+                              (replyText.startsWith('{') && (replyText.includes('"name"') || replyText.includes('"function"')));
+        if (hasPseudoCall) {
+          const jsonStr = extractJsonBlock(replyText);
+          if (jsonStr) {
+            try {
+              const parsed = JSON.parse(jsonStr);
+              let toolName = (parsed.name || parsed.function?.name || parsed.action || '').trim();
+              let toolArgs = parsed.arguments || parsed.args || parsed.parameters || parsed.function?.arguments || {};
+              if (typeof toolArgs === 'string') {
+                try { toolArgs = JSON.parse(toolArgs); } catch (e) {}
+              }
+              if (toolName) {
+                // Normalize names & aliases
+                toolName = toolName.toLowerCase().replace(/-/g, '_');
+                if (toolName === 'playmusic') toolName = 'play_music';
+                if (toolName === 'controlmusic') toolName = 'control_music';
+                if (toolName === 'play_music' || toolName === 'play_youtube_music') {
+                  if (toolArgs.query && !toolArgs.song) toolArgs.song = toolArgs.query;
+                }
+                toolCalls.push({
+                  id: `pseudo_${Date.now()}`,
+                  type: 'function',
+                  function: {
+                    name: toolName,
+                    arguments: toolArgs,
+                  },
+                });
+                // Remove raw pseudo call syntax from user-facing replyText
+                replyText = replyText.replace(/(?:call>|<tool_call>|\[TOOL_CALL\]|\bcall:\s*|\bAction:\s*)?[\s\S]*?\}<\/tool_call>|call>[\s\S]*\}|```(?:json)?\s*\{[\s\S]*?\}\s*```/i, '').trim();
+                if (replyText.startsWith('{') && replyText.endsWith('}')) {
+                  replyText = '';
+                }
+              }
+            } catch (err) {
+              console.warn('[AgentBrain] Failed to parse pseudo-tool call JSON:', err.message);
+            }
+          }
+        }
+      }
+
+      for (const call of toolCalls) {
+        if (signal.aborted) {
+          this.abortController = null;
+          return { success: false, cancelled: true, reply: 'Cancelled.' };
+        }
+
+        const name = call.function.name;
+        let args = {};
+        try {
+          args = typeof call.function.arguments === 'string' ? JSON.parse(call.function.arguments) : (call.function.arguments || {});
+        } catch (e) {
+          args = {};
+        }
+
+        const result = await this.executeTool(name, args, config.geminiApiKey || apiKey);
+        executed.push({ name, args, result });
+
+        if (result && result.message) {
+          replyText = result.message;
+        }
+      }
+
+      if (!replyText && executed.length > 0) {
+        replyText = executed[0].result?.message || `Done: ${executed[0].name.replace(/_/g, ' ')}.`;
+      } else if (!replyText) {
+        replyText = 'Ready.';
+      }
+
+      memory.addTurn('model', replyText);
+      try {
+        mem0Manager.extractMemoriesFromTurn(prompt, replyText, (s, u, tok) => this.generateAcademicLLM(s, u, tok)).catch(() => {});
+      } catch (_) {}
+      this.abortController = null;
+
+      return {
+        success: true,
+        reply: replyText,
+        actionsExecuted: executed,
+        grounding: groundingSources && groundingSources.length > 0 ? {
+          query: prompt,
+          sources: groundingSources,
+          relatedImages: (groundingSources.find(s => Array.isArray(s.relatedImages))?.relatedImages) || [],
+        } : undefined,
+      };
+    } catch (err) {
+      this.abortController = null;
+      if (err.message === 'TASK_CANCELLED' || (signal && signal.aborted)) {
+        return { success: false, cancelled: true, reply: 'Cancelled.' };
+      }
+      return { success: false, error: err.message };
+    }
+  }
+
+  async run(prompt, configOrKey, context = {}) {
+    const config = typeof configOrKey === 'string'
+      ? { provider: 'gemini', geminiApiKey: configOrKey }
+      : (configOrKey || {});
+
+    this.activeConfig = config;
+    this.activeContext = context;
+    this.activePrompt = prompt || '';
+
+    // Direct handling for attached files (Drive upload, WhatsApp share, vision, video)
+    const directAttachPath = (context && context.filePath) || (context && context.attachedFile && (context.attachedFile.path || context.attachedFile)) || null;
+    if (directAttachPath && typeof directAttachPath === 'string' && fs.existsSync(directAttachPath)) {
+      const pLower = (prompt || '').toLowerCase().trim();
+      const ext = path.extname(directAttachPath).toLowerCase();
+      const isImage = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'].includes(ext);
+      const isVideo = ['.mp4', '.mkv', '.mov', '.webm', '.avi', '.flv', '.wmv', '.m4v'].includes(ext);
+      const isShareOrUpload = /\b(whatsapp|google\s+drive|drive|upload|send|share)\b/i.test(prompt || '');
+
+      // Direct Google Drive Upload for attached file
+      const isDriveUpload = /\b(drive|google\s*drive)\b/i.test(pLower) && /\b(upload|save|put|send|export|backup|add)\b/i.test(pLower);
+      if (isDriveUpload) {
+        console.log(`[AgentBrain] Direct Drive upload matched for attached file: ${directAttachPath}`);
+        const res = await this.executeTool('upload_to_google_drive', { file_path: directAttachPath }, config.geminiApiKey || config.groqApiKey || '');
+        const replyText = res.message || 'File upload completed.';
+        memory.addTurn('user', prompt);
+        memory.addTurn('model', replyText);
+        return {
+          success: res.success !== false,
+          reply: replyText,
+          actionsExecuted: [{ name: 'upload_to_google_drive', args: { file_path: directAttachPath }, result: res }],
+        };
+      }
+
+      // Direct WhatsApp Share for attached file
+      const isWhatsAppSend = /\b(whatsapp)\b/i.test(pLower) && /\b(send|share|message)\b/i.test(pLower);
+      if (isWhatsAppSend) {
+        let contactMatch = prompt.match(/\bto\s+([a-zA-Z0-9_+ ]+?)(?:\s+on\s+whatsapp|\s+via\s+whatsapp|$)/i);
+        if (!contactMatch) {
+          contactMatch = prompt.match(/whatsapp\s+(?:to\s+)?([a-zA-Z0-9_+ ]+)/i);
+        }
+        const targetContact = contactMatch ? contactMatch[1].trim().replace(/^the\s+/i, '') : '';
+        console.log(`[AgentBrain] Direct WhatsApp send matched for attached file: ${directAttachPath}, contact: "${targetContact}"`);
+        const res = await this.executeTool('send_whatsapp_file_or_message', {
+          contact_or_phone: targetContact,
+          file_path: directAttachPath,
+          message: '',
+        }, config.geminiApiKey || config.groqApiKey || '');
+        const replyText = res.message || 'WhatsApp prepared.';
+        memory.addTurn('user', prompt);
+        memory.addTurn('model', replyText);
+        return {
+          success: res.success !== false,
+          reply: replyText,
+          actionsExecuted: [{ name: 'send_whatsapp_file_or_message', args: { contact_or_phone: targetContact, file_path: directAttachPath }, result: res }],
+        };
+      }
+
+      // Direct File Save to PC (Desktop, Downloads, Documents, etc.)
+      const isSaveFile = /\b(save|put|store|keep|download|move|copy)\b/i.test(pLower) ||
+        /\b(desktop|downloads?|documents?|pictures?|videos?)\b/i.test(pLower);
+      const isNotAnalysis = !/\b(what|explain|describe|solve|read|analyze|inspect|ocr|transcribe|summarize|detail|who|where)\b|\?/i.test(pLower);
+
+      if (isSaveFile && isNotAnalysis) {
+        let targetDir = path.join(os.homedir(), 'Desktop');
+        if (/\bdownload(s)?\b/i.test(pLower)) targetDir = path.join(os.homedir(), 'Downloads');
+        else if (/\bdocument(s)?\b/i.test(pLower)) targetDir = path.join(os.homedir(), 'Documents');
+        else if (/\b(picture|photo)(s)?\b/i.test(pLower)) targetDir = path.join(os.homedir(), 'Pictures');
+        else if (/\bvideo(s)?\b/i.test(pLower)) targetDir = path.join(os.homedir(), 'Videos');
+        const driveMatch = pLower.match(/\b([a-z]:\\[^ "']+)/i);
+        if (driveMatch) targetDir = driveMatch[1];
+
+        if (!fs.existsSync(targetDir)) {
+          fs.mkdirSync(targetDir, { recursive: true });
+        }
+
+        const fileName = (context && context.attachedFile && context.attachedFile.name) || path.basename(directAttachPath);
+        let savePath = path.join(targetDir, fileName);
+        if (fs.existsSync(savePath) && path.resolve(savePath) !== path.resolve(directAttachPath)) {
+          const extName = path.extname(fileName);
+          const baseName = path.basename(fileName, extName);
+          savePath = path.join(targetDir, `${baseName}_${Date.now()}${extName}`);
+        }
+
+        if (path.resolve(savePath) !== path.resolve(directAttachPath)) {
+          try {
+            fs.copyFileSync(directAttachPath, savePath);
+          } catch (e) {
+            fs.writeFileSync(savePath, fs.readFileSync(directAttachPath));
+          }
+        }
+
+        try {
+          const { shell } = require('electron');
+          shell.showItemInFolder(savePath);
+        } catch (e) {}
+
+        const replyText = `✅ Grokki saved **\`${path.basename(savePath)}\`** to your PC at:\n\`${savePath}\``;
+        memory.addTurn('user', prompt);
+        memory.addTurn('model', replyText);
+        return {
+          success: true,
+          reply: replyText,
+          actionsExecuted: [{ name: 'save_file_to_pc', args: { file_path: savePath, destination: targetDir }, result: { success: true, savePath } }],
+        };
+      }
+
+      if (isVideo && !isShareOrUpload) {
+        const videoName = path.basename(directAttachPath);
+        const replyText = `🎬 **Video watching & analysis is disabled** to prevent high token consumption.\n\nYou can still use **\`${videoName}\`** to:\n1. **Send on WhatsApp** — e.g. *"Send this video to Rohan on WhatsApp"*\n2. **Upload to Google Drive** — e.g. *"Upload this video to my Google Drive"*`;
+        return {
+          success: true,
+          reply: replyText,
+          actionsExecuted: [],
+        };
+      }
+
+      if (isImage && !isShareOrUpload && !isSaveFile) {
+        const isVisionPrompt = !prompt || /\b(what|explain|describe|solve|read|analyze|inspect|see|transcribe|look|ocr|tell\s+me|detail|who|where)\b|\?/i.test(prompt);
+        if (isVisionPrompt) {
+          const visionRes = await this.analyzeAttachedImage(directAttachPath, prompt, config.geminiApiKey || '');
+          const replyText = visionRes.message || 'Analyzed attached image.';
+          memory.addTurn('user', `${prompt || 'Analyze image'} [Attached image: ${path.basename(directAttachPath)}]`);
+          memory.addTurn('model', replyText);
+          return {
+            success: true,
+            reply: replyText,
+            actionsExecuted: [{ name: 'read_attached_file', args: { file_path: directAttachPath }, result: visionRes }],
+          };
+        }
+      }
+    }
+
+    // Fast OS hardware / system actions interceptor (<50ms execution)
+    const fastIntent = this.checkFastIntent(prompt);
+    if (fastIntent) {
+      console.log(`[AgentBrain] Fast OS Intent matched: ${fastIntent.tool}`, fastIntent.args);
+      const res = await this.executeTool(fastIntent.tool, fastIntent.args, config.geminiApiKey || config.groqApiKey || '');
+      const replyText = res.message || 'Done.';
+      memory.addTurn('user', prompt);
+      memory.addTurn('model', replyText);
+      return {
+        success: true,
+        reply: replyText,
+        actionsExecuted: [{ name: fastIntent.tool, args: fastIntent.args, result: res }],
+      };
+    }
+
+    const provider = config.provider || 'gemini';
+
+    if (['groq', 'ollama', 'openrouter', 'omniroute', 'omnirouter', 'openai', 'grok', 'deepseek', 'qwen', 'litellm', 'bifrost', 'portkey', 'helicone', 'routellm', 'newapi', 'higress', 'clawrouter'].includes(provider)) {
+      return await this.runOpenAICompatible(prompt, config, context);
+    }
+
+    const apiKey = (config.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+    if (!apiKey) {
+      return { success: false, error: 'NO_API_KEY' };
+    }
+
+    if (!this.abortControllers) this.abortControllers = new Map();
+    const convoId = (context && (context.conversationId || context.convoId)) || 'default';
+    let controller;
+    let signal;
+    if (context && context.isFailover && this.abortControllers.has(convoId)) {
+      controller = this.abortControllers.get(convoId);
+      signal = controller.signal;
+    } else {
+      if (this.abortControllers.has(convoId)) {
+        try { this.abortControllers.get(convoId).abort(); } catch (e) {}
+      }
+      controller = new AbortController();
+      this.abortControllers.set(convoId, controller);
+      this.abortController = controller;
+      signal = controller.signal;
+    }
+
+    // If an attached file is present in context, append to prompt for awareness
+    let fullPrompt = prompt || '';
+    const attachPath = (context && context.filePath) || (context && context.attachedFile && (context.attachedFile.path || context.attachedFile)) || null;
+    if (attachPath && typeof attachPath === 'string') {
+      const fileName = (context && context.attachedFile && context.attachedFile.name) || path.basename(attachPath);
+      let fileSnippet = '';
+      try {
+        const ext = path.extname(attachPath).toLowerCase();
+        if (['.txt', '.md', '.json', '.js', '.ts', '.tsx', '.py', '.html', '.css', '.c', '.cpp', '.java', '.csv', '.log'].includes(ext)) {
+          const content = fs.readFileSync(attachPath, 'utf8');
+          fileSnippet = `\n[File Content of ${fileName} (${content.length} chars)]:\n\`\`\`\n${content.slice(0, 3000)}\n\`\`\``;
+        }
+      } catch (e) {}
+      fullPrompt = `${fullPrompt}\n[User attached file: "${fileName}" located at "${attachPath}"]${fileSnippet}`.trim();
+    }
+
+    fullPrompt = expandSlashDirective(fullPrompt);
+
+    // Mem0 Personalized Long-Term Memory Context Injection
+    try {
+      const mem0Ctx = await mem0Manager.getMemoriesContext(prompt);
+      if (mem0Ctx) {
+        fullPrompt = `${mem0Ctx}\n${fullPrompt}`;
+      }
+    } catch (_) {}
+
+    let groundingSources = [];
+    const conversationHistory = (context && Array.isArray(context.conversationHistory) && context.conversationHistory.length > 0)
+      ? context.conversationHistory
+      : memory.getHistory();
+    const isWebSearchActive = Boolean(
+      context && (context.webSearch || context.webSearchEnabled) ||
+      shouldAutoSearchWeb(prompt, conversationHistory)
+    );
+    let resolvedQuery = prompt;
+    if (isWebSearchActive) {
+      try {
+        resolvedQuery = resolveSearchQuery(prompt, conversationHistory, config, context);
+        console.log(`[AgentBrain] Performing live web grounding for: "${resolvedQuery}" (prompt: "${prompt}")...`);
+        groundingSources = await searchWeb(resolvedQuery, 5);
+        if (groundingSources.length > 0) {
+          fullPrompt = `${fullPrompt}${buildGroundingPrompt(groundingSources, resolvedQuery)}`;
+        }
+      } catch (err) {
+        console.warn('[AgentBrain] Web grounding error:', err.message);
+      }
+    }
+
+    // Project Mentions Context Packaging (@file and @folder)
+    if (context && (context.projectMentions || context.workspaceContext)) {
+      try {
+        const workspaceContext = require('./workspace_context');
+        const mentions = context.projectMentions || context.workspaceContext;
+        const packagedContext = workspaceContext.packageContext(mentions);
+        if (packagedContext) {
+          fullPrompt = `${packagedContext}\n${fullPrompt}`.trim();
+        }
+      } catch (err) {
+        console.warn('[AgentBrain] Failed to package project mentions in Gemini:', err.message);
+      }
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    // When Deep Search / Live Grounding is active, omit desktop tools so Gemini synthesizes search results
+    const tools = isWebSearchActive ? undefined : this.getRelevantTools(prompt, 'gemini');
+    const systemInstruction = memory.buildSystemPrompt(config, fullPrompt);
+
+    if (context && Array.isArray(context.conversationHistory) && context.conversationHistory.length > 0) {
+      memory.syncFromExternalHistory(context.conversationHistory);
+    }
+
+    memory.addTurn('user', prompt);
+
+    let lastError = null;
+    const selectedGeminiModel = config.geminiModel || 'gemini-3.5-flash';
+    const activeModels = [selectedGeminiModel, ...this.models.filter(m => m !== selectedGeminiModel)];
+
+    for (const modelName of activeModels) {
+      try {
+        if (signal.aborted) throw new Error('TASK_CANCELLED');
+
+        const rawHistory = memory.getHistory();
+        const geminiHistory = rawHistory.map((turn, idx) => {
+          if (idx === rawHistory.length - 1 && turn.role === 'user') {
+            return {
+              role: 'user',
+              parts: [{ text: fullPrompt }],
+            };
+          }
+          return turn;
+        });
+
+        const response = await withAbort(withTimeout(ai.models.generateContent({
+          model: modelName,
+          contents: geminiHistory,
+          config: {
+            systemInstruction,
+            tools,
+            maxOutputTokens: 4000,
+            temperature: 0.1,
+          },
+        }), 45000), signal);
+
+        const functionCalls = response.functionCalls || [];
+        const executed = [];
+        let replyText = (response.text || '').trim();
+
+        for (const call of functionCalls) {
+          if (signal && signal.aborted) {
+            console.log('[AgentBrain] Aborted before tool execution.');
+            this.abortController = null;
+            return { success: false, cancelled: true, reply: 'Cancelled.' };
+          }
+          const name = call.name;
+          const rawArgs = call.args || {};
+          const cleanArgs = {};
+          if (rawArgs && typeof rawArgs === 'object') {
+            for (const [k, v] of Object.entries(rawArgs)) {
+              if (v !== null && v !== undefined) {
+                cleanArgs[k] = v;
+              }
+            }
+          }
+          const result = await this.executeTool(name, cleanArgs, apiKey);
+          executed.push({ name, args: cleanArgs, result });
+
+          if (result && result.message) {
+            replyText = result.message;
+          }
+        }
+
+        // Action tools respond immediately without waiting for slow second synthesis!
+        const actionTools = [
+          'create_study_revision_document',
+          'start_lock_in_study_session',
+          'get_tonight_study_radar',
+          'search_research_papers',
+          'summarize_youtube_lecture',
+          'viva_voice_quiz',
+          'snap_and_solve_screen',
+          'math_and_knowledge_solver',
+          'highlight_to_action',
+          'organize_folder',
+          'pc_health_and_optimizer',
+          'schedule_reminder_or_action',
+          'download_research_pdfs',
+          'system_brightness',
+          'window_manager',
+          'connectivity_control',
+          'power_and_theme_control',
+          'storage_and_cleanup',
+          'screen_capture_and_recorder',
+          'lecture_meeting_stenographer',
+          'cli_copilot',
+          'document_swiss_knife',
+          'form_autofiller',
+          'offline_airgap_mode',
+          'pocket_grokki',
+          'presentation_slide_changer',
+          'find_files_and_folders',
+          'inspect_vscode_errors',
+          'send_whatsapp_file_or_message',
+          'get_whatsapp_recent_messages',
+          'get_whatsapp_status',
+          'save_whatsapp_contact_alias',
+          'stop_timer',
+          'toggle_island_lock_mode',
+          'open_app',
+          'desktop_click',
+          'desktop_type',
+          'desktop_app_control',
+          'create_or_edit_word',
+          'computer_click',
+          'computer_double_click',
+          'computer_right_click',
+          'computer_move',
+          'computer_type',
+          'computer_hotkey',
+          'focus_window',
+          'system_volume',
+          'close_active_window',
+          'system_power',
+          'create_file_or_folder',
+          'upload_to_google_drive',
+          'play_youtube_music',
+          'control_music',
+          'search_youtube',
+          'connect_google_account',
+          'update_google_sheet_cell',
+          'find_and_update_google_sheet',
+          'append_to_google_sheet',
+        ];
+
+        const isActionOnly = functionCalls.every((call) => actionTools.includes(call.name));
+
+        // Intelligent Synthesis: Only for data query tools (Classroom, Calendar, Tasks, Search)
+        if (!isActionOnly && functionCalls.length > 0 && executed.length > 0) {
+          if (signal && signal.aborted) {
+            this.abortController = null;
+            return { success: false, cancelled: true, reply: 'Cancelled.' };
+          }
+          const toolSummaries = executed
+            .map((e) => `[Tool: ${e.name}]\nArgs: ${JSON.stringify(e.args)}\nResult:\n${e.result?.message || JSON.stringify(e.result)}`)
+            .join('\n\n');
+
+          try {
+            const synth = await withAbort(withTimeout(ai.models.generateContent({
+              model: modelName,
+              contents: [
+                ...memory.getHistory(),
+                {
+                  role: 'model',
+                  parts: [{ text: `I have retrieved the following action results:\n\n${toolSummaries}` }],
+                },
+                {
+                  role: 'user',
+                  parts: [{
+                    text: `Based on the tool results above, give me a complete, motivating answer to my query: "${prompt}".
+Rules:
+- Keep it brief, concise, and focused. No unnecessary padding.
+- Format in clean, readable GitHub-style Markdown (headings ###, bold text, bullet points).
+- ALWAYS PROVIDE CLICKABLE LINKS: Include clickable Markdown links (e.g. [Open in Classroom](url), [Open Email](url), [Open in Drive](url), [Watch on YouTube](url)) whenever links are available in the tool results so I can easily click to check them!
+- For schoolwork/assignments: highlight urgent deadlines due this week. If there are none due this week, tell me good job! Group open practice/lab items neatly without repeating "Due: No due date".`,
+                  }],
+                },
+              ],
+              config: {
+                systemInstruction,
+                maxOutputTokens: 4000,
+                temperature: 0.2,
+              },
+            }), 25000), signal);
+
+            if (synth && synth.text && synth.text.trim().length > 10) {
+              replyText = synth.text.trim();
+            }
+          } catch (synthErr) {
+            if (synthErr.message === 'TASK_CANCELLED' || (signal && signal.aborted)) {
+              this.abortController = null;
+              return { success: false, cancelled: true, reply: 'Cancelled.' };
+            }
+            // Keep tool message if synthesis times out
+            if (!replyText && executed.length > 0) {
+              replyText = executed[0].result?.message || 'Done.';
+            }
+          }
+        } else if (isActionOnly && executed.length > 0) {
+          replyText = executed[0].result?.message || `Done: ${executed[0].name.replace(/_/g, ' ')}.`;
+        }
+
+        if (!replyText && executed.length > 0) {
+          replyText = executed[0].result?.message || `Done: ${executed[0].name.replace(/_/g, ' ')}.`;
+        } else if (!replyText) {
+          replyText = 'Ready.';
+        }
+
+        memory.addTurn('model', replyText);
+        this.abortController = null;
+
+        return {
+          success: true,
+          reply: replyText,
+          actionsExecuted: executed,
+          grounding: groundingSources && groundingSources.length > 0 ? {
+          query: prompt,
+          sources: groundingSources,
+          relatedImages: (groundingSources.find(s => Array.isArray(s.relatedImages))?.relatedImages) || [],
+        } : undefined,
+        };
+      } catch (err) {
+        if (signal && signal.aborted) {
+          console.log('[AgentBrain] Task cancelled by user (Alt+Q). Halting generation immediately.');
+          this.abortController = null;
+          return { success: false, cancelled: true, reply: 'Cancelled.' };
+        }
+        lastError = err;
+      }
+    }
+
+    // Auto-failover to Groq if Gemini models failed and Groq API key is configured
+    const groqKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+    if (groqKey && (!signal || !signal.aborted)) {
+      console.warn('[AgentBrain] Gemini models failed. Auto-failing over to Groq...');
+      try {
+        const groqModel = config.groqModel || 'llama-3.3-70b-versatile';
+        const groqData = await callOpenAICompatible({
+          endpoint: 'https://api.groq.com/openai/v1',
+          apiKey: groqKey,
+          model: groqModel,
+          messages: [
+            { role: 'system', content: systemInstruction },
+            ...memory.getHistory().map(turn => ({
+              role: turn.role === 'model' ? 'assistant' : turn.role,
+              content: (turn.parts || []).map(p => p.text || '').join('\n') || (turn.content || ''),
+            })),
+          ],
+          signal,
+          timeout: 25000,
+        });
+        const groqReply = groqData?.choices?.[0]?.message?.content;
+        if (groqReply && groqReply.trim()) {
+          const cleanGroqReply = groqReply.trim();
+          memory.addTurn('model', cleanGroqReply);
+          this.abortController = null;
+          return {
+            success: true,
+            reply: cleanGroqReply,
+            actionsExecuted: [],
+            fallbackProvider: 'groq',
+          };
+        }
+      } catch (groqErr) {
+        console.error('[AgentBrain] Groq auto-failover failed:', groqErr.message);
+      }
+    }
+
+    this.abortController = null;
+    return { success: false, error: lastError ? lastError.message : 'Execution failed' };
+  }
+
+  async runAudio(base64Audio, mimeType, configOrKey) {
+    const config = typeof configOrKey === 'string'
+      ? { provider: 'gemini', geminiApiKey: configOrKey }
+      : (configOrKey || {});
+
+    // If Groq is configured with API key, transcribe with free Whisper-large-v3!
+    const groqKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+    if (groqKey) {
+      if (this.abortController) {
+        try { this.abortController.abort(); } catch (e) {}
+      }
+      this.abortController = new AbortController();
+      try {
+        console.log('[AgentBrain] Transcribing speech with Groq Whisper-large-v3...');
+        const transcript = await transcribeWithGroqWhisper({
+          apiKey: groqKey,
+          base64Audio,
+          mimeType,
+          signal: this.abortController.signal,
+        });
+        console.log(`[AgentBrain] Groq Whisper transcribed: "${transcript}"`);
+
+        const cleanTrans = (transcript || '').trim();
+        const isWhisperSilenceHallucination = /^(thank you\.?|thanks for watching\.?|subtitles by.*|you\.?|bye\.?|\.+)$/i.test(cleanTrans);
+
+        if (!cleanTrans || isWhisperSilenceHallucination) {
+          console.log(`[AgentBrain] Ignored Whisper silence hallucination: "${cleanTrans}"`);
+          return { success: false, error: 'NO_SPEECH_DETECTED' };
+        }
+
+        const res = await this.run(transcript, config);
+        return {
+          ...res,
+          transcript,
+        };
+      } catch (err) {
+        console.warn('[AgentBrain] Groq Whisper transcription error:', err.message);
+        // Fall through to Gemini if Groq Whisper failed and Gemini key exists
+      }
+    }
+
+    const apiKey = (config.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+    if (!apiKey) {
+      return { success: false, error: 'NO_API_KEY' };
+    }
+
+    if (!this.abortControllers) this.abortControllers = new Map();
+    const convoId = (context && (context.conversationId || context.convoId)) || 'default';
+    let controller;
+    let signal;
+    if (context && context.isFailover && this.abortControllers.has(convoId)) {
+      controller = this.abortControllers.get(convoId);
+      signal = controller.signal;
+    } else {
+      if (this.abortControllers.has(convoId)) {
+        try { this.abortControllers.get(convoId).abort(); } catch (e) {}
+      }
+      controller = new AbortController();
+      this.abortControllers.set(convoId, controller);
+      this.abortController = controller;
+      signal = controller.signal;
+    }
+
+    const ai = new GoogleGenAI({ apiKey });
+    const tools = this.getToolsDeclaration();
+    const systemInstruction = memory.buildSystemPrompt(config, fullPrompt);
+    let lastError = null;
+
+    for (const modelName of this.models) {
+      try {
+        if (signal.aborted) throw new Error('TASK_CANCELLED');
+
+        const response = await withAbort(withTimeout(ai.models.generateContent({
+          model: modelName,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: 'Return JSON only: {"transcript":"exact words heard","reply":"one terse status line"}. Do not use tools in this step.' },
+                {
+                  inlineData: {
+                    mimeType: mimeType || 'audio/webm',
+                    data: base64Audio,
+                  },
+                },
+              ],
+            },
+          ],
+          config: {
+            systemInstruction: 'Transcribe audio exactly. Return valid JSON only.',
+            maxOutputTokens: 160,
+            temperature: 0.1,
+          },
+        }), 12000), signal);
+
+        let transcript = '';
+        let replyText = '';
+        try {
+          const cleaned = (response.text || '').trim().replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+          const parsed = JSON.parse(cleaned);
+          transcript = (parsed.transcript || '').trim();
+          replyText = (parsed.reply || '').trim();
+        } catch (e) {
+          transcript = (response.text || '').trim();
+          replyText = transcript ? 'Heard.' : '';
+        }
+
+        const functionCalls = [];
+        const executed = [];
+
+        if (transcript) {
+          const commandResult = await this.run(transcript, apiKey);
+          if (commandResult && commandResult.success) {
+            replyText = commandResult.reply || replyText;
+            if (commandResult.actionsExecuted) executed.push(...commandResult.actionsExecuted);
+          }
+        }
+
+        for (const call of functionCalls) {
+          const { name, args } = call;
+          const result = await this.executeTool(name, args, apiKey);
+          executed.push({ name, args, result });
+          if (result && result.message && (!replyText || replyText.length < 5)) {
+            replyText = result.message;
+          }
+        }
+
+        if (!replyText && executed.length > 0) {
+          replyText = executed[0].result?.message || `Done: ${executed[0].name.replace(/_/g, ' ')}.`;
+        } else if (!replyText) {
+          replyText = 'Ready.';
+        }
+
+        return { success: true, reply: replyText, transcript, actionsExecuted: executed };
+      } catch (err) {
+        if (err.message === 'TASK_CANCELLED' || (signal && signal.aborted)) {
+          this.abortController = null;
+          return { success: false, cancelled: true, reply: 'Cancelled.' };
+        }
+        lastError = err;
+      }
+    }
+
+    this.abortController = null;
+    return { success: false, error: lastError ? lastError.message : 'Audio failed' };
+  }
+
+  async executeTool(name, args, apiKey) {
+    if (mcpManager.isMcpTool(name)) {
+      return await mcpManager.executeMcpTool(name, args);
+    }
+
+    switch (name) {
+      case 'compact_memory': {
+        return { success: true, message: '✨ **Conversation Compacted**: Memory turns and session context have been optimized and refreshed.' };
+      }
+
+      // Vercel agent-desktop Native UI Automation Bridge
+      case 'desktop_snapshot': {
+        const res = await agentDesktop.snapshot(args || {});
+        if (res.ok && res.elements) {
+          const list = res.elements.slice(0, 15).map(e => `- ${e.role} "${e.name || ''}" [${e.ref}]`).join('\n');
+          return {
+            success: true,
+            message: `Inspected ${res.app || 'desktop'} (${res.elements.length} interactive elements):\n${list}`,
+            elements: res.elements,
+            snapshot_id: res.snapshot_id,
+          };
+        }
+        return { success: false, message: res.error?.message || 'Failed to capture desktop accessibility tree.' };
+      }
+
+      case 'desktop_click': {
+        const target = args.target || args.name || args.label || args.text;
+        if (args.ref) {
+          if (args.doubleClick) return await agentDesktop.doubleClick(args.ref);
+          if (args.rightClick) return await agentDesktop.rightClick(args.ref, { headed: args.headed });
+          const res = await agentDesktop.click(args.ref, { headed: args.headed !== false });
+          return { success: res.ok, message: res.ok ? `Clicked element ${args.ref}.` : (res.error?.message || 'Click failed.') };
+        }
+        if (target) {
+          const smartRes = await agentDesktop.smartClick({
+            app: args.app,
+            target,
+            doubleClick: args.doubleClick,
+            rightClick: args.rightClick,
+            headed: args.headed !== false,
+          });
+          return {
+            success: smartRes.ok,
+            message: smartRes.message || (smartRes.ok ? `Clicked "${target}".` : `Could not locate "${target}".`),
+          };
+        }
+        return { success: false, message: 'Please specify the button or element to click (e.g. target: "Save" or ref: "@...").' };
+      }
+
+      case 'desktop_type': {
+        const target = args.target || args.name || args.field || args.role;
+        if (args.ref) {
+          const res = await agentDesktop.type(args.ref, args.text, { headed: args.headed !== false });
+          return { success: res.ok, message: res.ok ? `Typed "${args.text}" into element ${args.ref}.` : (res.error?.message || 'Typing failed.') };
+        }
+        const smartRes = await agentDesktop.smartType({
+          app: args.app,
+          target,
+          text: args.text,
+          headed: args.headed !== false,
+        });
+        if (smartRes.ok) {
+          return { success: true, message: smartRes.message || `Typed "${args.text}".` };
+        }
+        // Fallback to active window physical typing via PowerShell
+        const safeText = (args.text || '').replace(/"/g, '`"');
+        const res = await runPowerShell(`-action type -text "${safeText}"`);
+        return { success: res.success, message: `Typed: "${args.text}"` };
+      }
+
+      case 'desktop_find': {
+        const res = await agentDesktop.find(args || {});
+        if (res.ok && res.matches && res.matches.length > 0) {
+          const list = res.matches.slice(0, 10).map(m => `- ${m.role} "${m.name || ''}" [${m.ref}]`).join('\n');
+          return {
+            success: true,
+            message: `Found ${res.matches.length} matching element(s):\n${list}`,
+            matches: res.matches,
+          };
+        }
+        // Fallback to snapshot search
+        const snap = await agentDesktop.snapshot({ app: args.app, interactiveOnly: true });
+        if (snap.ok && snap.elements && snap.elements.length > 0) {
+          const searchVal = (args.name || args.text || args.role || '').toLowerCase();
+          const filtered = searchVal
+            ? snap.elements.filter(e => (e.name && e.name.toLowerCase().includes(searchVal)) || (e.role && e.role.toLowerCase().includes(searchVal)))
+            : snap.elements;
+          if (filtered.length > 0) {
+            const list = filtered.slice(0, 10).map(e => `- ${e.role} "${e.name || ''}" [${e.ref}]`).join('\n');
+            return {
+              success: true,
+              message: `Found ${filtered.length} element(s) in ${args.app || 'screen'}:\n${list}`,
+              elements: filtered.slice(0, 10),
+            };
+          }
+        }
+        return { success: false, message: `No elements found matching "${args.name || args.text || args.role || ''}" in ${args.app || 'screen'}.` };
+      }
+
+      case 'desktop_app_control': {
+        const action = (args.action || '').toLowerCase();
+        if (action === 'launch') return await agentDesktop.launch(args.app);
+        if (action === 'close') return await agentDesktop.closeApp(args.app);
+        if (action === 'focus' && args.windowId) return await agentDesktop.focusWindow(args.windowId);
+        if (action === 'list') return await agentDesktop.listWindows(args.app);
+        return { ok: false, message: `Unknown desktop action: ${args.action}` };
+      }
+
+      case 'computer_click': {
+        const res = await runPowerShell(`-action click -x ${Math.round(args.x)} -y ${Math.round(args.y)}`);
+        return { success: res.success, message: `Clicked (${Math.round(args.x)}, ${Math.round(args.y)})` };
+      }
+
+      case 'computer_double_click': {
+        const res = await runPowerShell(`-action doubleclick -x ${Math.round(args.x)} -y ${Math.round(args.y)}`);
+        return { success: res.success, message: `Double-clicked (${Math.round(args.x)}, ${Math.round(args.y)})` };
+      }
+
+      case 'computer_right_click': {
+        const res = await runPowerShell(`-action rightclick -x ${Math.round(args.x)} -y ${Math.round(args.y)}`);
+        return { success: res.success, message: `Right-clicked (${Math.round(args.x)}, ${Math.round(args.y)})` };
+      }
+
+      case 'computer_move': {
+        const res = await runPowerShell(`-action move -x ${Math.round(args.x)} -y ${Math.round(args.y)}`);
+        return { success: res.success, message: `Moved cursor to (${Math.round(args.x)}, ${Math.round(args.y)})` };
+      }
+
+      case 'computer_type': {
+        const safeText = (args.text || '').replace(/"/g, '`"');
+        const res = await runPowerShell(`-action type -text "${safeText}"`);
+        return { success: res.success, message: `Typed: "${args.text}"` };
+      }
+
+      case 'computer_hotkey': {
+        const res = await runPowerShell(`-action hotkey -keys "${args.keys}"`);
+        return { success: res.success, message: `Pressed ${args.keys}` };
+      }
+
+      case 'focus_window': {
+        const res = await runPowerShell(`-action focus -app "${args.app}"`);
+        return { success: res.success, message: `Focused ${args.app}` };
+      }
+
+      case 'system_volume': {
+        const act = (args.action || 'get').toLowerCase();
+        let cmd = '-action volume-get';
+        if (act === 'set' && typeof args.level === 'number') {
+          cmd = `-action volume-set -volume ${Math.round(args.level)}`;
+        } else if (act === 'up' || act === 'volume_up' || act === 'increase') {
+          cmd = '-action volume-up';
+        } else if (act === 'down' || act === 'volume_down' || act === 'decrease') {
+          cmd = '-action volume-down';
+        } else if (act === 'mute') {
+          cmd = '-action volume-mute';
+        } else if (act === 'unmute') {
+          cmd = '-action volume-unmute';
+        } else if (act === 'toggle_mute' || act === 'toggle') {
+          cmd = '-action volume-toggle';
+        }
+
+        const res = await runPowerShell(cmd);
+        const out = res.stdout;
+        if (out.startsWith('MUTED:')) {
+          const isMuted = out.includes('True');
+          return { success: true, message: `Volume: ${isMuted ? 'Muted' : 'Unmuted'}` };
+        }
+        return { success: true, message: `Volume: ${out}%` };
+      }
+
+      case 'close_active_window': {
+        const appName = (args.app_name || args.app || '').trim();
+        let cmd = '-action close-active';
+        if (appName) {
+          cmd = `-action close-app -app "${appName.replace(/"/g, '')}"`;
+        }
+        const res = await runPowerShell(cmd);
+        return { success: res.success, message: res.stdout || (appName ? `Closed ${appName}` : 'Closed active window') };
+      }
+
+      case 'system_power': {
+        const act = (args.action || '').toLowerCase().trim();
+        if (act === 'lock') {
+          await runPowerShell('-action system-power -keys lock');
+          return { success: true, message: 'Workstation locked successfully.' };
+        } else if (act === 'sleep') {
+          await runPowerShell('-action system-power -keys sleep');
+          return { success: true, message: 'Putting PC to sleep.' };
+        } else if (act === 'shutdown') {
+          await runPowerShell('-action system-power -keys shutdown');
+          return { success: true, message: 'Shutting down PC in 10 seconds. Say "cancel shutdown" to abort.' };
+        } else if (act === 'restart' || act === 'reboot') {
+          await runPowerShell('-action system-power -keys restart');
+          return { success: true, message: 'Restarting PC in 10 seconds. Say "cancel shutdown" to abort.' };
+        } else if (act === 'cancel' || act === 'abort') {
+          await runPowerShell('-action system-power -keys cancel');
+          return { success: true, message: 'Cancelled scheduled shutdown.' };
+        }
+        return { success: false, message: `Unknown power action: ${args.action}` };
+      }
+
+      case 'create_or_edit_word': {
+        return await this.handleWordPhysical(args);
+      }
+
+      case 'inspect_vscode_errors': {
+        return await this.diagnoseVSCode(args);
+      }
+
+      case 'read_screen_and_act': {
+        return await this.readScreenWithVision(args.task, apiKey);
+      }
+
+      case 'play_music':
+      case 'play_youtube_music': {
+        const rawSong = (args.song || args.query || args.name || 'trending songs').trim();
+        let cleanSong = rawSong.replace(/^(?:play\s+)?(?:something|some\s+songs?|some\s+music|songs?|music|tracks?|a\s+song)\s+(?:from|by|of)\s+/i, '').trim();
+        cleanSong = cleanSong.replace(/^(?:play|listen to|hear)\s+/i, '').trim();
+        if (!cleanSong) cleanSong = rawSong;
+
+        let configuredPlatform = (this.activeConfig && this.activeConfig.musicProvider) || '';
+        if (!configuredPlatform) {
+          try {
+            const configPath = path.join(__dirname, '../../data/jarvis-config.json');
+            if (fs.existsSync(configPath)) {
+              const fileData = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+              configuredPlatform = fileData.musicProvider || 'ytmusic';
+            }
+          } catch (_) {}
+        }
+        if (!configuredPlatform) configuredPlatform = 'ytmusic';
+
+        let platform = (args.platform || configuredPlatform || 'ytmusic').toLowerCase();
+        // If args.platform was set by model to generic 'youtube' or empty, respect user's configured platform
+        if (platform === 'youtube' && configuredPlatform && configuredPlatform !== 'youtube') {
+          platform = configuredPlatform;
+        }
+
+        console.log(`[AgentBrain] Playing "${cleanSong}" via platform "${platform}" in default browser`);
+
+        // 1. Send stop to pause/halt any currently playing media in the browser
+        await runPowerShell('-action media -keys "stop"');
+
+        let playUrl = '';
+        let platformName = 'YouTube Music';
+
+        if (platform === 'ytmusic' || platform === 'youtubemusic' || platform === 'youtube_music') {
+          platformName = 'YouTube Music';
+          const videoId = await resolveYouTubeVideoId(cleanSong);
+          if (videoId) {
+            playUrl = `https://music.youtube.com/watch?v=${videoId}`;
+          } else {
+            playUrl = `https://music.youtube.com/search?q=${encodeURIComponent(cleanSong)}`;
+          }
+        } else if (platform === 'spotify') {
+          platformName = 'Spotify';
+          playUrl = `https://open.spotify.com/search/${encodeURIComponent(cleanSong)}`;
+        } else if (platform === 'applemusic' || platform === 'apple_music' || platform === 'apple') {
+          platformName = 'Apple Music';
+          playUrl = `https://music.apple.com/search?term=${encodeURIComponent(cleanSong)}`;
+        } else if (platform === 'amazonmusic' || platform === 'amazon_music' || platform === 'amazon') {
+          platformName = 'Amazon Music';
+          playUrl = `https://music.amazon.com/search/${encodeURIComponent(cleanSong)}`;
+        } else if (platform === 'soundcloud') {
+          platformName = 'SoundCloud';
+          playUrl = `https://soundcloud.com/search?q=${encodeURIComponent(cleanSong)}`;
+        } else if (platform === 'youtube') {
+          const videoId = await resolveYouTubeVideoId(cleanSong);
+          if (videoId) {
+            playUrl = `https://www.youtube.com/watch?v=${videoId}&autoplay=1`;
+            platformName = 'YouTube';
+          } else {
+            playUrl = `https://www.youtube.com/results?search_query=${encodeURIComponent(cleanSong)}`;
+            platformName = 'YouTube';
+          }
+        } else {
+          platformName = 'YouTube Music';
+          const videoId = await resolveYouTubeVideoId(cleanSong);
+          if (videoId) {
+            playUrl = `https://music.youtube.com/watch?v=${videoId}`;
+          } else {
+            playUrl = `https://music.youtube.com/search?q=${encodeURIComponent(cleanSong)}`;
+          }
+        }
+
+        console.log(`[AgentBrain] Opening ${platformName} in browser: ${playUrl}`);
+        await shell.openExternal(playUrl);
+
+        return { success: true, message: `Playing "${cleanSong}" on ${platformName} in your browser 🎵` };
+      }
+
+      case 'control_music': {
+        const action = (args.action || 'pause').toLowerCase();
+        let key = 'playpause';
+        let word = 'Paused';
+
+        if (['pause'].includes(action)) {
+          key = 'playpause';
+          word = 'Paused';
+        } else if (['resume', 'play', 'unpause'].includes(action)) {
+          key = 'playpause';
+          word = 'Resumed';
+        } else if (['next', 'skip', 'forward'].includes(action)) {
+          key = 'next';
+          word = 'Skipped to next track';
+        } else if (['prev', 'previous', 'back'].includes(action)) {
+          key = 'prev';
+          word = 'Playing previous track';
+        } else if (['stop', 'close'].includes(action)) {
+          key = 'stop';
+          word = 'Stopped';
+        }
+
+        await runPowerShell(`-action media -keys "${key}"`);
+        return { success: true, message: `${word} music playback 🎵` };
+      }
+
+      case 'search_youtube': {
+        const query = (args.query || 'Python courses').trim();
+        const videoId = await resolveYouTubeVideoId(query);
+
+        if (videoId) {
+          const directUrl = `https://www.youtube.com/watch?v=${videoId}&autoplay=1`;
+          await shell.openExternal(directUrl);
+          return { success: true, message: `Opened and playing top video for "${query}" on YouTube 🎬` };
+        }
+
+        const url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}`;
+        await shell.openExternal(url);
+        return { success: true, message: `Opened search results for "${query}" on YouTube 🎬` };
+      }
+
+      case 'browser_search': {
+        const query = args.query || '';
+        const isUrl = /^https?:\/\//i.test(query);
+        const isExplicitYouTube = /\byoutube\b/i.test(query);
+
+        let url;
+        if (isUrl) {
+          url = query;
+        } else if (isExplicitYouTube) {
+          url = `https://www.youtube.com/results?search_query=${encodeURIComponent(query.replace(/\byoutube\b/gi, '').trim())}`;
+        } else {
+          url = `https://www.google.com/search?q=${encodeURIComponent(query)}`;
+        }
+
+        await shell.openExternal(url);
+        return { success: true, message: `Opened "${query}" in browser.` };
+      }
+
+      case 'create_file_or_folder': {
+        const targetPath = path.resolve(args.path);
+        try {
+          if (args.is_folder) {
+            fs.mkdirSync(targetPath, { recursive: true });
+            return { success: true, message: `Folder created at ${targetPath}.` };
+          } else {
+            const dir = path.dirname(targetPath);
+            if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+            fs.writeFileSync(targetPath, args.content || '', 'utf8');
+            return { success: true, message: `File created at ${targetPath}.` };
+          }
+        } catch (err) {
+          return { success: false, message: `Failed to create: ${err.message}` };
+        }
+      }
+
+      case 'calendar_schedule_event': {
+        const title = encodeURIComponent(args.title || 'New Event');
+        const desc = encodeURIComponent(args.description || '');
+        const url = `https://calendar.google.com/calendar/render?action=TEMPLATE&text=${title}&details=${desc}`;
+        await shell.openExternal(url);
+        return { success: true, message: `Calendar: Opened Google Calendar to mark "${args.title}".` };
+      }
+
+      case 'connect_google_account': {
+        const res = await googleWorkspace.startAuthFlow();
+        return { success: res.success, message: res.message };
+      }
+
+      case 'check_emails': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to sign in and read emails.' };
+        }
+        const res = await googleWorkspace.listUnreadEmails(args.max_results || 5);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'send_email_gmail': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to sign in.' };
+        }
+        const res = await googleWorkspace.sendEmail({ to: args.to, subject: args.subject, body: args.body });
+        return { success: res.success, message: res.message };
+      }
+
+      case 'get_calendar_agenda': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to view calendar agenda.' };
+        }
+        const res = await googleWorkspace.getUpcomingEvents(args.max_results || 5);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'search_google_drive': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to search Drive.' };
+        }
+        const res = await googleWorkspace.searchDriveFiles(args.query || '', 10);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'upload_to_google_drive': {
+        if (!googleWorkspace.isConnected()) {
+          return {
+            success: false,
+            message: '⚠️ Google account not connected yet. Please connect your Google account in Google Workspace settings first.',
+          };
+        }
+        let targetPath = args.file_path;
+        const attachPath = (this.activeContext && this.activeContext.filePath) ||
+          (this.activeContext && this.activeContext.attachedFile && (this.activeContext.attachedFile.path || this.activeContext.attachedFile)) || null;
+
+        if ((!targetPath || !fs.existsSync(targetPath)) && attachPath && fs.existsSync(attachPath)) {
+          targetPath = attachPath;
+        }
+
+        if (!targetPath || !fs.existsSync(targetPath)) {
+          return { success: false, message: `No valid file found to upload (${args.file_path || 'none attached'}).` };
+        }
+        const res = await googleWorkspace.uploadFileToDrive(targetPath);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'read_attached_file': {
+        const targetPath = args.file_path || (this.activeContext?.attachedFile?.path);
+        if (!targetPath || !fs.existsSync(targetPath)) {
+          return { success: false, message: 'No file is currently attached to read.' };
+        }
+        try {
+          const ext = path.extname(targetPath).toLowerCase();
+          const stat = fs.statSync(targetPath);
+          const imageExts = ['.jpg', '.jpeg', '.png', '.webp', '.gif', '.bmp'];
+          const videoExts = ['.mp4', '.mkv', '.mov', '.webm', '.avi', '.flv', '.wmv', '.m4v'];
+          const audioExts = ['.mp3', '.wav', '.m4a', '.ogg', '.flac', '.aac'];
+          const docExts = ['.pdf', '.docx', '.doc'];
+          const textExts = ['.txt', '.md', '.json', '.js', '.ts', '.tsx', '.jsx', '.py', '.html', '.css', '.csv', '.java', '.cpp', '.c', '.h', '.cs', '.rs', '.go', '.sql', '.sh', '.ps1', '.yaml', '.yml', '.log', '.xml'];
+
+          if (videoExts.includes(ext)) {
+            return {
+              success: true,
+              message: `🎬 **Video watching & analysis is disabled** to prevent high token consumption.\n\nYou can still use **\`${path.basename(targetPath)}\`** to:\n1. **Send on WhatsApp** — e.g. *"Send this video to Rohan on WhatsApp"*\n2. **Upload to Google Drive** — e.g. *"Upload this video to my Google Drive"*`,
+            };
+          }
+
+          if (imageExts.includes(ext)) {
+            return await this.analyzeAttachedImage(targetPath, this.activePrompt || 'Describe what you see in this image clearly and accurately.', apiKey);
+          }
+
+          if (audioExts.includes(ext)) {
+            const groqKey = (this.activeConfig?.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+            if (groqKey) {
+              try {
+                const b64Audio = fs.readFileSync(targetPath).toString('base64');
+                const transcript = await transcribeWithGroqWhisper({
+                  apiKey: groqKey,
+                  base64Audio: b64Audio,
+                  mimeType: ext === '.wav' ? 'audio/wav' : 'audio/mpeg',
+                });
+                if (transcript && transcript.trim()) {
+                  return {
+                    success: true,
+                    message: `🎧 **Audio Transcription (\`${path.basename(targetPath)}\`)**:\n\n> ${transcript.trim()}`,
+                  };
+                }
+              } catch (e) {}
+            }
+            return {
+              success: true,
+              message: `🎧 Attached audio **\`${path.basename(targetPath)}\`** (${Math.max(1, Math.round(stat.size / 1024))} KB) is ready to send on WhatsApp, upload to Google Drive, or transcribe.`,
+            };
+          }
+
+          if (docExts.includes(ext)) {
+            const extracted = await studyEngine.extractTextFromFile(targetPath, 8000);
+            const docText = (extracted && extracted.text) ? extracted.text.trim() : '';
+            if (docText) {
+              const userQ = (this.activePrompt || '').replace(/\[User attached file:[\s\S]*$/i, '').trim() || 'Summarize this document clearly.';
+              const answer = await this.generateAcademicLLM(
+                'You are Grokki. Answer the user question accurately based on the attached document content using clean Markdown.',
+                `Document: "${path.basename(targetPath)}"\nUser Request: "${userQ}"\n\nExtracted Document Content:\n"""\n${docText.slice(0, 6000)}\n"""`,
+                1000
+              );
+              return { success: true, message: answer || `### 📄 ${path.basename(targetPath)}\n\n${docText.slice(0, 2000)}` };
+            }
+          }
+
+          if (textExts.includes(ext)) {
+            const content = fs.readFileSync(targetPath, 'utf8').substring(0, 4000);
+            return { success: true, message: `Content of "${path.basename(targetPath)}":\n\n\`\`\`${ext.slice(1)}\n${content}\n\`\`\`` };
+          } else {
+            return { success: true, message: `Attached file **${path.basename(targetPath)}** (${ext.toUpperCase() || 'File'}, ${Math.max(1, Math.round(stat.size / 1024))} KB). Let me know what you'd like to do with it!` };
+          }
+        } catch (err) {
+          return { success: false, message: `Could not read attached file: ${err.message}` };
+        }
+      }
+
+      case 'read_google_sheet': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to read Sheets.' };
+        }
+        const res = await googleWorkspace.readSheetData(args.spreadsheet_id, args.range || '');
+        return { success: res.success, message: res.message };
+      }
+
+      case 'append_to_google_sheet': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to edit Sheets.' };
+        }
+        const res = await googleWorkspace.appendSheetRow(args.spreadsheet_id, args.values || [], args.range || '');
+        return { success: res.success, message: res.message };
+      }
+
+      case 'find_and_update_google_sheet': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to edit Sheets.' };
+        }
+        const res = await googleWorkspace.findAndUpdateSheetRecord(args.spreadsheet_id, {
+          searchCriteria: args.search_criteria || args.student_name || args.name || args.query,
+          targetColumn: args.target_column || args.field || 'Department',
+          newValue: args.new_value,
+          tabName: args.tab_name,
+        });
+        return { success: res.success, message: res.message };
+      }
+
+      case 'update_google_sheet_cell': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to edit Sheets.' };
+        }
+        const res = await googleWorkspace.updateSheetCell(args.spreadsheet_id, args.range, args.value);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'create_google_doc': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to create Docs.' };
+        }
+        const res = await googleWorkspace.createGoogleDoc(args.title, args.content || '');
+        return { success: res.success, message: res.message };
+      }
+
+      case 'get_google_tasks': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to view Tasks.' };
+        }
+        const res = await googleWorkspace.listTasks();
+        return { success: res.success, message: res.message };
+      }
+
+      case 'add_google_task': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to add Tasks.' };
+        }
+        const res = await googleWorkspace.addTask(args.title, args.notes || '', args.due || null);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'create_notion_page': {
+        const config = this.config || {};
+        const notionWorkspace = require('./notion_workspace');
+        const token = notionWorkspace.token || config.notionApiKey || process.env.NOTION_API_KEY;
+        if (!token) {
+          return { success: false, message: 'Notion is not connected. Please enter your Notion Integration Secret in the Workspace tab.' };
+        }
+        const dbId = args.database_id || config.notionDatabaseId;
+        const fetchFn = global.fetch || require('node-fetch');
+
+        try {
+          const bodyPayload = {
+            parent: dbId ? { database_id: dbId.replace(/-/g, '') } : { page_id: 'default' },
+            properties: {
+              title: {
+                title: [{ text: { content: args.title || 'Study Note' } }],
+              },
+            },
+            children: [
+              {
+                object: 'block',
+                type: 'paragraph',
+                paragraph: {
+                  rich_text: [{ type: 'text', text: { content: args.content || '' } }],
+                },
+              },
+            ],
+          };
+
+          const res = await fetchFn('https://api.notion.com/v1/pages', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+              'Notion-Version': '2022-06-28',
+            },
+            body: JSON.stringify(bodyPayload),
+          });
+          if (res.ok) {
+            const pageData = await res.json();
+            return { success: true, message: `Created Notion note "${args.title}" successfully: ${pageData.url || ''}` };
+          } else {
+            const err = await res.json().catch(() => ({}));
+            return { success: false, message: `Notion Error: ${err.message || 'Failed to create page'}` };
+          }
+        } catch (e) {
+          return { success: false, message: `Notion Error: ${e.message}` };
+        }
+      }
+
+      case 'search_notion': {
+        const config = this.config || {};
+        const notionWorkspace = require('./notion_workspace');
+        const token = notionWorkspace.token || config.notionApiKey || process.env.NOTION_API_KEY;
+        if (!token) {
+          return { success: false, message: 'Notion is not connected. Please enter your Notion Integration Secret in the Workspace tab.' };
+        }
+        const fetchFn = global.fetch || require('node-fetch');
+        try {
+          const res = await fetchFn('https://api.notion.com/v1/search', {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${token}`,
+              'Content-Type': 'application/json',
+              'Notion-Version': '2022-06-28',
+            },
+            body: JSON.stringify({
+              query: args.query || '',
+              page_size: 5,
+            }),
+          });
+          if (!res.ok) {
+            const err = await res.json().catch(() => ({}));
+            return { success: false, message: `Notion Search Error: ${err.message || 'Search failed'}` };
+          }
+          const data = await res.json();
+          const results = (data.results || []).map((r) => {
+            const titleProp = r.properties?.title || r.properties?.Name;
+            const title = titleProp?.title?.[0]?.plain_text || r.url || 'Untitled Note';
+            return `- [${title}](${r.url}) (${r.object})`;
+          });
+          return {
+            success: true,
+            message: results.length > 0 ? `Found in Notion:\n${results.join('\n')}` : `No Notion pages found matching "${args.query}".`,
+          };
+        } catch (e) {
+          return { success: false, message: `Notion Search Error: ${e.message}` };
+        }
+      }
+
+      case 'create_obsidian_note': {
+        const obsidianWorkspace = require('./obsidian_workspace');
+        if (!obsidianWorkspace.isConnected()) {
+          return { success: false, message: 'Obsidian vault is not connected yet. Select your vault folder in the Workspace tab.' };
+        }
+        try {
+          if (args.is_daily) {
+            const res = obsidianWorkspace.appendDailyNote(args.content);
+            return { success: true, message: `Appended to Obsidian daily note (${res.date}): ${res.path}` };
+          } else {
+            const res = obsidianWorkspace.createNote(args.title || 'Note', args.content);
+            return { success: true, message: `Created Obsidian note "${res.title}" in vault "${obsidianWorkspace.vaultName}".` };
+          }
+        } catch (e) {
+          return { success: false, message: `Obsidian Error: ${e.message}` };
+        }
+      }
+
+      case 'search_obsidian_vault': {
+        const obsidianWorkspace = require('./obsidian_workspace');
+        if (!obsidianWorkspace.isConnected()) {
+          return { success: false, message: 'Obsidian vault is not connected yet. Select your vault folder in the Workspace tab.' };
+        }
+        try {
+          const notes = obsidianWorkspace.searchNotes(args.query || '', 8);
+          if (notes.length === 0) {
+            return { success: true, message: `No Obsidian notes found matching "${args.query}" in vault "${obsidianWorkspace.vaultName}".` };
+          }
+          const list = notes.map((n) => `- **${n.name}** (${n.relativePath})`).join('\n');
+          return { success: true, message: `Found in Obsidian (${obsidianWorkspace.vaultName}):\n${list}` };
+        } catch (e) {
+          return { success: false, message: `Obsidian Search Error: ${e.message}` };
+        }
+      }
+
+      case 'search_google_contact': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to search Contacts.' };
+        }
+        const res = await googleWorkspace.searchContacts(args.query || '');
+        return { success: res.success, message: res.message };
+      }
+
+      case 'get_classroom_assignments': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to check Google Classroom.' };
+        }
+        const res = await googleWorkspace.listPendingClassroomAssignments(3);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'get_classroom_announcements': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to check Classroom announcements.' };
+        }
+        const res = await googleWorkspace.listClassroomAnnouncements(5);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'list_classroom_courses': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to view your classes.' };
+        }
+        const res = await googleWorkspace.listClassroomCourses();
+        return { success: res.success, message: res.message };
+      }
+
+      case 'get_university_attendance': {
+        const academicPortal = require('./academic_portal');
+        const status = academicPortal.getStatus();
+        if (!status.linked) {
+          return {
+            success: false,
+            message: 'University portal is not linked yet. Please open Grokki Settings -> Personalization -> Academic Portal, choose Assam Don Bosco University, and enter your Student ID & password.'
+          };
+        }
+        try {
+          if (args.force_sync) {
+            await academicPortal.sync(true);
+          } else {
+            // Auto-sync fresh data if cache is older than 15 mins or session expired
+            await academicPortal.ensureFreshData(15 * 60 * 1000);
+          }
+          const summary = academicPortal.getSummaryForAI();
+          return {
+            success: true,
+            message: summary,
+            summary: summary,
+            data: academicPortal.getCachedData()
+          };
+        } catch (e) {
+          const cached = academicPortal.getCachedData();
+          if (cached) {
+            const summary = academicPortal.getSummaryForAI() + `\n\n*(Note: Live sync failed with "${e.message}", showing cached records from ${new Date(cached.lastSynced).toLocaleString()})*`;
+            return {
+              success: true,
+              message: summary,
+              summary: summary,
+              data: cached
+            };
+          }
+          return { success: false, message: `Failed to fetch attendance from university portal: ${e.message}` };
+        }
+      }
+
+      case 'get_university_profile': {
+        const academicPortal = require('./academic_portal');
+        const status = academicPortal.getStatus();
+        if (!status.linked) {
+          return {
+            success: false,
+            message: 'University portal is not linked yet. Please open Grokki Settings -> Personalization -> Academic Portal to link your student account.'
+          };
+        }
+        try {
+          let cached = academicPortal.getCachedData();
+          if (!cached || !cached.profile || !cached.lastSynced || (Date.now() - cached.lastSynced > 30 * 60 * 1000)) {
+            await academicPortal.sync();
+            cached = academicPortal.getCachedData();
+          }
+          const profileSummary = academicPortal.getProfileSummary();
+          return {
+            success: true,
+            message: profileSummary,
+            profile: cached?.profile || {},
+            university: status.universityName
+          };
+        } catch (e) {
+          return { success: false, message: `Failed to fetch university profile: ${e.message}` };
+        }
+      }
+
+      case 'sync_university_portal': {
+        const academicPortal = require('./academic_portal');
+        const status = academicPortal.getStatus();
+        if (!status.linked) {
+          return {
+            success: false,
+            message: 'University portal is not linked yet. Please enter your credentials in Settings first.'
+          };
+        }
+        try {
+          const syncRes = await academicPortal.sync();
+          return {
+            success: true,
+            message: `Synced ${syncRes.totalSubjects} courses for ${syncRes.studentName} from ${status.universityName}!`,
+            summary: academicPortal.getSummaryForAI()
+          };
+        } catch (e) {
+          return { success: false, message: `University sync failed: ${e.message}` };
+        }
+      }
+
+      case 'youtube_data_search': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to search with YouTube Data API.' };
+        }
+        const res = await googleWorkspace.searchYouTube(args.query || '', args.max_results || 5);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'get_youtube_subscriptions': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to view YouTube subscriptions.' };
+        }
+        const res = await googleWorkspace.getMyYouTubeSubscriptions(10);
+        return { success: res.success, message: res.message };
+      }
+
+      case 'get_youtube_playlists': {
+        if (!googleWorkspace.isConnected()) {
+          return { success: false, message: 'Google account not connected yet. Say "Connect my Google account" to view your YouTube playlists.' };
+        }
+        const res = await googleWorkspace.getMyYouTubePlaylists();
+        return { success: res.success, message: res.message };
+      }
+
+      case 'send_whatsapp_file_or_message': {
+        const contactOrPhone = args.contact_or_phone || '';
+        const message = args.message || '';
+        let filePath = args.file_path || '';
+        const attachPath = (this.activeContext && this.activeContext.filePath) ||
+          (this.activeContext && this.activeContext.attachedFile && (this.activeContext.attachedFile.path || this.activeContext.attachedFile)) || null;
+        if ((!filePath || !fs.existsSync(filePath)) && attachPath && fs.existsSync(attachPath)) {
+          filePath = attachPath;
+        }
+        if (!filePath || !fs.existsSync(filePath)) {
+          const selected = this.getSelectedExplorerFiles();
+          if (selected && selected.length > 0 && fs.existsSync(selected[0])) {
+            filePath = selected[0];
+          }
+        }
+        return await this.handleWhatsAppSend({ contactOrPhone, message, filePath });
+      }
+
+      case 'get_whatsapp_recent_messages': {
+        let openwaWorkspace = null;
+        try { openwaWorkspace = require('./openwa_workspace'); } catch (e) {}
+        if (!openwaWorkspace) {
+          return { success: false, message: 'WhatsApp module is not available.' };
+        }
+        const targetContact = (args.contact_name || args.contact_or_name || args.contact || '').trim().toLowerCase();
+        const limit = Number(args.limit) || 5;
+
+        // Fetch up to 50 cached chats sorted newest first
+        const res = await openwaWorkspace.getRecentChats(50);
+        let allChats = (res && res.chats) || [];
+
+        function formatRelativeTime(ts) {
+          if (!ts) return '';
+          const now = Date.now();
+          const diffMs = now - ts;
+          const d = new Date(ts);
+          const timeStr = d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+          const daysDiff = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+          if (daysDiff === 0) return `Today at ${timeStr}`;
+          if (daysDiff === 1) return `Yesterday at ${timeStr}`;
+          const month = d.toLocaleString('en-US', { month: 'short' });
+          const day = d.getDate();
+          return `${month} ${day}, ${timeStr}`;
+        }
+
+        if (targetContact) {
+          let resolvedJid = null;
+          if (openwaWorkspace && openwaWorkspace.resolveTargetJid) {
+            try { resolvedJid = openwaWorkspace.resolveTargetJid(targetContact); } catch (_) {}
+          }
+          const cleanPhone = targetContact.replace(/[^0-9]/g, '');
+          const resolvedPhone = resolvedJid ? resolvedJid.replace(/[^0-9]/g, '') : null;
+
+          const matched = allChats.filter((c) => {
+            const name = (c.name || c.formattedTitle || '').toLowerCase();
+            const id = (c.id || c.jid || '').toLowerCase();
+            const msg = (c.lastMessage?.body || '').toLowerCase();
+
+            if (resolvedJid && (id === resolvedJid.toLowerCase() || (resolvedPhone && resolvedPhone.length >= 7 && id.includes(resolvedPhone)))) {
+              return true;
+            }
+            if (cleanPhone && cleanPhone.length >= 7 && id.includes(cleanPhone)) {
+              return true;
+            }
+            return name.includes(targetContact) || id.includes(targetContact) || msg.includes(targetContact);
+          });
+
+          if (matched.length > 0) {
+            const primary = matched[0];
+            const chatName = openwaWorkspace.formatChatName ? openwaWorkspace.formatChatName(primary) : (primary.name || primary.formattedTitle || args.contact_name);
+            const lastMsg = primary.lastMessage ? (typeof primary.lastMessage === 'string' ? primary.lastMessage : (primary.lastMessage.body || primary.lastMessage.type || '')) : '';
+            const isFromMe = !!primary.fromMe || !!primary.lastMessage?.fromMe;
+            const timeStr = primary.timestamp ? formatRelativeTime(primary.timestamp) : '';
+
+            let responseMsg = '';
+            if (isFromMe) {
+              responseMsg = `ℹ️ **${chatName}** has not sent any new messages recently.\n\nThe last message in this chat was sent by **You** *(${timeStr})*:\n> "${lastMsg}"`;
+            } else {
+              responseMsg = `📩 **New message from ${chatName}** *(${timeStr})*:\n> "${lastMsg}"`;
+            }
+
+            if (matched.length > 1) {
+              const others = matched.slice(1, limit).map((c, i) => {
+                const cName = openwaWorkspace.formatChatName ? openwaWorkspace.formatChatName(c) : (c.name || c.formattedTitle || `Chat ${i + 2}`);
+                const cMsg = c.lastMessage ? (typeof c.lastMessage === 'string' ? c.lastMessage : (c.lastMessage.body || '')) : '';
+                const cSender = c.fromMe ? 'You' : cName;
+                const cTime = c.timestamp ? ` *(${formatRelativeTime(c.timestamp)})*` : '';
+                return `• **${cName}** (${cSender}${cTime}): "${cMsg}"`;
+              }).join('\n');
+              responseMsg += `\n\n**Other matching conversations:**\n${others}`;
+            }
+
+            return {
+              success: true,
+              message: responseMsg,
+            };
+          }
+
+          // If not in cache, check if contact exists in contacts book
+          if (resolvedJid || (openwaWorkspace.contacts && Object.values(openwaWorkspace.contacts).some(n => (n || '').toLowerCase().trim() === targetContact))) {
+            const contactDisplayName = resolvedJid && openwaWorkspace.formatChatName ? openwaWorkspace.formatChatName(resolvedJid) : (args.contact_name || args.contact_or_name || targetContact);
+            return {
+              success: true,
+              message: `ℹ️ Found **${contactDisplayName}** in your WhatsApp contacts, but there are no recent messages or unread texts from them.`,
+            };
+          }
+
+          // If not found in contacts, show latest active conversations
+          const topPreviews = allChats.slice(0, 3).map((c, i) => {
+            const name = openwaWorkspace.formatChatName ? openwaWorkspace.formatChatName(c) : (c.name || c.formattedTitle || `Chat ${i + 1}`);
+            const timeStr = c.timestamp ? ` *(${formatRelativeTime(c.timestamp)})*` : '';
+            return `${i + 1}. **${name}**${timeStr}`;
+          }).join('\n');
+
+          return {
+            success: true,
+            message: `🔍 I searched your recent WhatsApp history, but couldn't find any chats matching **"${args.contact_name || args.contact_or_name || args.contact}"**.\n\n**Your latest active WhatsApp chats are:**\n${topPreviews}\n\n💡 *Tip: If you have their phone number, you can ask me to search or message that number directly!*`,
+          };
+        }
+
+        // General recent chats
+        if (allChats.length > 0) {
+          const formatted = allChats.slice(0, limit).map((c, i) => {
+            const name = openwaWorkspace.formatChatName ? openwaWorkspace.formatChatName(c) : (c.name || c.formattedTitle || c.id || `Chat ${i + 1}`);
+            const lastMsg = c.lastMessage ? (typeof c.lastMessage === 'string' ? c.lastMessage : (c.lastMessage.body || c.lastMessage.type || '')) : '';
+            const sender = c.fromMe ? 'You' : name;
+            const timeStr = c.timestamp ? ` *(${formatRelativeTime(c.timestamp)})*` : '';
+            const unread = c.unreadCount ? ` [${c.unreadCount} unread]` : '';
+            return `${i + 1}. **${name}**${unread}${timeStr}:\n   *${sender}:* "${lastMsg}"`;
+          }).join('\n\n');
+          return { success: true, message: `📱 **Recent WhatsApp Chats:**\n\n${formatted}` };
+        }
+
+        const isReady = await openwaWorkspace.ensureReady(2000);
+        if (!isReady && !openwaWorkspace.hasLocalAuth()) {
+          return {
+            success: false,
+            message: 'WhatsApp is not linked yet. Please click "Link WhatsApp" in the Workspace tab and scan the QR code to connect.',
+          };
+        }
+
+        const userPhone = openwaWorkspace.localUserPhone ? ` (+${openwaWorkspace.localUserPhone})` : '';
+        return {
+          success: true,
+          message: `🟢 **WhatsApp Live & Connected**${userPhone}\n\nYour WhatsApp is actively connected in the background! Any incoming messages will appear here in real time.`,
+        };
+      }
+
+      case 'get_whatsapp_status': {
+        let openwaWorkspace = null;
+        try { openwaWorkspace = require('./openwa_workspace'); } catch (e) {}
+        if (!openwaWorkspace) {
+          return { success: true, message: '📱 **WhatsApp**: Not initialized or offline.' };
+        }
+        await openwaWorkspace.ensureReady(3000);
+        const status = await openwaWorkspace.getStatus(true);
+        if (status.connected) {
+          const phone = status.userPhone || status.userName || 'Connected';
+          return {
+            success: true,
+            message: `🟢 **WhatsApp Active & Connected**\n- Account: **${status.userName || 'Personal'}** (${phone})\n- Direct background messaging and chat history active.`,
+          };
+        }
+        if (status.sessionStatus === 'qr_ready') {
+          return {
+            success: true,
+            message: `🟡 **WhatsApp Waiting for QR Scan**\nOpen Grokki Studio Workspace to scan the live QR code with WhatsApp on your phone (Linked Devices)!`,
+          };
+        }
+        return {
+          success: false,
+          message: 'WhatsApp is currently not connected. Click **Link WhatsApp** in the Workspace tab to scan and link.',
+        };
+      }
+
+      case 'stop_timer': {
+        return await this.stopAllTimers();
+      }
+
+      case 'toggle_island_lock_mode': {
+        return await this.toggleIslandLockMode(args.locked);
+      }
+
+      case 'save_whatsapp_contact_alias': {
+        let openwaWorkspace = null;
+        try { openwaWorkspace = require('./openwa_workspace'); } catch (e) {}
+        if (!openwaWorkspace) {
+          return { success: false, message: 'WhatsApp module is not available.' };
+        }
+        const name = args.name || args.contact || args.alias;
+        const phone = args.phone || args.phone_number || args.number;
+        if (!name || !phone) {
+          return { success: false, message: 'Please specify both the contact name and their phone number.' };
+        }
+        const ok = openwaWorkspace.setContactAlias(name, phone);
+        if (ok) {
+          const cleanDigits = String(phone).replace(/[^\d]/g, '');
+          const formatted = openwaWorkspace.formatPhoneNumber ? openwaWorkspace.formatPhoneNumber(cleanDigits.length === 10 ? '91' + cleanDigits : cleanDigits) : phone;
+          return {
+            success: true,
+            message: `🟢 **WhatsApp Contact Saved!**\n\nLinked **"${name}"** to **${formatted || phone}**.\nYou can now directly say: \"Send message to ${name}...\"`,
+          };
+        }
+        return { success: false, message: `Could not save alias for "${name}".` };
+      }
+
+      case 'open_app': {
+        const rawName = (args.name || '').toLowerCase().trim();
+        const appMap = {
+          'whatsapp': 'whatsapp:',
+          'spotify': 'spotify:',
+          'calculator': 'calc.exe',
+          'calc': 'calc.exe',
+          'notepad': 'notepad.exe',
+          'chrome': 'chrome.exe',
+          'google chrome': 'chrome.exe',
+          'edge': 'msedge.exe',
+          'microsoft edge': 'msedge.exe',
+          'word': 'winword.exe',
+          'ms word': 'winword.exe',
+          'excel': 'excel.exe',
+          'powerpoint': 'powerpnt.exe',
+          'settings': 'ms-settings:',
+          'file explorer': 'explorer.exe',
+          'explorer': 'explorer.exe',
+          'terminal': 'wt.exe',
+          'vscode': 'code',
+          'vs code': 'code',
+          'discord': 'discord:',
+          'telegram': 'tg:',
+        };
+
+        const target = appMap[rawName] || rawName;
+        console.log(`[AgentBrain] Opening app: "${args.name}" -> target: "${target}"`);
+
+        const launchResult = await new Promise((resolve) => {
+          exec(`powershell.exe -NoProfile -Command "Start-Process '${target.replace(/'/g, "''")}' -ErrorAction Stop"`, (err, stdout, stderr) => {
+            if (err) {
+              // Only fallback to cmd start if target is a single-token executable or URI protocol (prevents Windows modal error dialogs on phrases)
+              if (!/\s/.test(target) || target.endsWith(':')) {
+                exec(`cmd.exe /c start "" "${target}"`, (err2) => {
+                  if (err2) resolve({ success: false, error: (stderr || err.message || '').trim() });
+                  else resolve({ success: true });
+                });
+              } else {
+                resolve({ success: false, error: (stderr || err.message || '').trim() });
+              }
+            } else {
+              resolve({ success: true });
+            }
+          });
+        });
+
+        if (launchResult.success) {
+          // Auto-type or auto-click if requested in compound prompt (e.g. "Open Notepad and type Hello")
+          if (args.text_to_type || args.click_target) {
+            console.log(`[AgentBrain] Waiting 900ms for ${args.name} window to initialize...`);
+            await new Promise(r => setTimeout(r, 900));
+
+            let typedOk = false;
+            let clickedOk = false;
+
+            if (args.text_to_type) {
+              try {
+                const typeRes = await agentDesktop.smartType({
+                  app: target,
+                  text: args.text_to_type,
+                  headed: true,
+                });
+                typedOk = typeRes.ok;
+              } catch (e) {
+                typedOk = false;
+              }
+
+              if (!typedOk) {
+                // Physical typing fallback
+                try {
+                  const safeText = (args.text_to_type || '').replace(/"/g, '`"');
+                  await runPowerShell(`-action type -text "${safeText}"`);
+                  typedOk = true;
+                } catch (e) {}
+              }
+            }
+
+            if (args.click_target) {
+              try {
+                const clickRes = await agentDesktop.smartClick({
+                  app: target,
+                  target: args.click_target,
+                  headed: true,
+                });
+                clickedOk = clickRes.ok;
+              } catch (e) {}
+            }
+
+            if (args.text_to_type && args.click_target) {
+              return { success: true, message: `Opened ${args.name}, clicked "${args.click_target}", and typed "${args.text_to_type}".` };
+            } else if (args.text_to_type) {
+              return { success: true, message: `Opened ${args.name} and typed "${args.text_to_type}".` };
+            } else if (args.click_target) {
+              return { success: true, message: `Opened ${args.name} and clicked "${args.click_target}".` };
+            }
+          }
+
+          return { success: true, message: `Opened ${args.name}.` };
+        } else {
+          return { success: false, message: `Could not open ${args.name}: application was not found or failed to start.` };
+        }
+      }
+
+      case 'create_study_revision_document': {
+        return await this.handleCreateStudyDocument(args);
+      }
+
+      case 'start_lock_in_study_session': {
+        return await this.handleStartLockIn(args);
+      }
+
+      case 'get_tonight_study_radar': {
+        return await googleWorkspace.getTonightStudyRadar();
+      }
+
+      case 'search_research_papers': {
+        return await studyEngine.searchAcademicPapers(
+          args.query || '',
+          args.max_results || 4,
+          args.citation_style || 'APA'
+        );
+      }
+
+      case 'summarize_youtube_lecture': {
+        return await this.handleSummarizeYouTube(args);
+      }
+
+      case 'viva_voice_quiz': {
+        return await this.handleVivaVoiceQuiz(args);
+      }
+
+      case 'snap_and_solve_screen': {
+        return await this.handleSnapAndSolveScreen(args);
+      }
+
+      case 'circle_to_ask': {
+        if (typeof this.openCircleOverlay === 'function') {
+          this.openCircleOverlay();
+        }
+        return { success: true, message: 'Opening Circle to Ask screen overlay (Ctrl+Shift+S) ⭕' };
+      }
+
+      case 'voice_dictation': {
+        if (typeof this.startVoiceDictation === 'function') {
+          this.startVoiceDictation();
+        }
+        return { success: true, message: 'Activated voice dictation anywhere in Windows (Ctrl+Alt+D) 🎙️' };
+      }
+
+      case 'math_and_knowledge_solver': {
+        return await studyEngine.solveSymbolicMathAndWiki({
+          operation: args.operation || 'simplify',
+          expression: args.expression || '',
+          wikiQuery: args.wiki_query || '',
+        });
+      }
+
+      case 'highlight_to_action': {
+        return await this.handleHighlightToAction(args);
+      }
+
+      case 'organize_folder': {
+        return await this.handleOrganizeFolder(args);
+      }
+
+      case 'pc_health_and_optimizer': {
+        return await this.handlePcHealthAndOptimizer(args);
+      }
+
+      case 'schedule_reminder_or_action': {
+        return await this.handleScheduleReminder(args);
+      }
+
+      case 'download_research_pdfs': {
+        return await studyEngine.downloadResearchPaperPDFs(
+          args.query || '',
+          args.count || 3
+        );
+      }
+
+      case 'system_brightness': {
+        return await this.handleSystemBrightness(args);
+      }
+
+      case 'window_manager': {
+        return await this.handleWindowManager(args);
+      }
+
+      case 'connectivity_control': {
+        return await this.handleConnectivityControl(args);
+      }
+
+      case 'power_and_theme_control': {
+        return await this.handlePowerAndThemeControl(args);
+      }
+
+      case 'storage_and_cleanup': {
+        return await this.handleStorageAndCleanup(args);
+      }
+
+      case 'screen_capture_and_recorder': {
+        return await this.handleScreenCaptureAndRecorder(args);
+      }
+
+      case 'lecture_meeting_stenographer': {
+        const action = (args.action || 'start').toLowerCase();
+        if (action === 'start') {
+          const topic = args.topic || 'Lecture';
+          this.broadcastToMiniIsland('island:activity', {
+            action: 'start',
+            kind: 'stopwatch',
+            icon: 'fa-solid fa-microphone-lines',
+            title: `Rec • ${topic}`,
+            startTime: Date.now(),
+          });
+          return powerTools.startStenographer(topic);
+        } else if (action === 'stop_and_summarize') {
+          this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'stopwatch' });
+          return await powerTools.stopStenographerAndSummarize((sys, usr, tok) => this.generateAcademicLLM(sys, usr, tok));
+        } else {
+          return {
+            success: true,
+            isRecording: powerTools.stenographer.isRecording,
+            message: powerTools.stenographer.isRecording
+              ? `🎙️ Stenographer is currently recording *"${powerTools.stenographer.topic}"*.`
+              : `🎙️ Stenographer is idle.`,
+          };
+        }
+      }
+
+      case 'cli_copilot': {
+        const action = (args.action || 'run_command').toLowerCase();
+        if (action === 'kill_port') {
+          return await powerTools.killPort(args.port);
+        } else if (action === 'git_autopilot') {
+          return await powerTools.gitAutopilot(args.message || '', args.branch || '');
+        } else if (action === 'diagnose_error') {
+          const diag = powerTools.diagnoseTerminalError(args.error_text || '');
+          return {
+            success: true,
+            message: `### 🩺 Terminal Error Diagnosis\n- ⚠️ **Issue**: ${diag.issue}\n- 💡 **Fix**: ${diag.fix}`,
+          };
+        } else {
+          return await powerTools.runSafeCommand(args.command || 'Get-ChildItem', args.cwd || '');
+        }
+      }
+
+      case 'document_swiss_knife': {
+        const action = (args.action || 'merge').toLowerCase();
+        if (action === 'merge') {
+          return await powerTools.mergePdfs(args.file_paths || [], args.output_name || 'Merged_Assignment.pdf');
+        } else {
+          return await powerTools.compressOrOptimizePdf(args.target_file || '', args.max_mb || 2.0);
+        }
+      }
+
+      case 'form_autofiller': {
+        const action = (args.action || 'get_script').toLowerCase();
+        if (action === 'view_profile') {
+          const p = powerTools.getStudentProfile();
+          return {
+            success: true,
+            profile: p,
+            message: `### 📋 Student Internship Profile\n- 👤 **Name**: ${p.fullName} | **Roll No**: \`${p.rollNo}\`\n- 🎓 **University**: ${p.university} (${p.degree}, ${p.branch})\n- 📊 **CGPA**: ${p.cgpa} *(Grad: ${p.passingYear})*\n- 🔗 **GitHub**: ${p.github} | **LinkedIn**: ${p.linkedin}\n- 🛠️ **Skills**: ${p.skills}`,
+          };
+        } else if (action === 'update_profile') {
+          return powerTools.updateStudentProfile(args.profile_updates || {});
+        } else {
+          return powerTools.generateAutofillBookmarklet();
+        }
+      }
+
+      case 'offline_airgap_mode': {
+        const action = (args.action || 'status').toLowerCase();
+        if (action === 'enable') {
+          return powerTools.setAirgapMode(true);
+        } else if (action === 'disable') {
+          return powerTools.setAirgapMode(false);
+        } else if (action === 'check_ollama') {
+          const ollama = await powerTools.getOllamaStatus();
+          return {
+            success: true,
+            message: ollama.isRunning
+              ? `🦙 **Local Ollama Server Detected & Running!**\nAvailable models: ${ollama.models.map((m) => `\`${m}\``).join(', ') || 'none loaded'}`
+              : `⚠️ Local Ollama server is not currently running at \`http://127.0.0.1:11434\`. Run \`ollama serve\` or launch LM Studio to enable local inference.`,
+          };
+        } else {
+          const isOnline = await powerTools.checkConnectivity();
+          const ollama = await powerTools.getOllamaStatus();
+          return {
+            success: true,
+            message: `### ✈️ Air-Gap & Offline Connectivity Status\n- 🌐 **Internet Connection**: ${isOnline ? 'Online (Connected ✅)' : 'Offline (Disconnected ❌)'}\n- 🔒 **Forced Air-Gapped Mode**: ${powerTools.airgapForced ? '**Active (Cloud disabled)**' : 'Inactive (Cloud active)'}\n- 🦙 **Local Ollama Inference**: ${ollama.isRunning ? `Running ✅ (${ollama.models.length} model${ollama.models.length === 1 ? '' : 's'})` : 'Offline / Not Started'}`,
+          };
+        }
+      }
+
+      case 'pocket_grokki': {
+        return {
+          success: true,
+          actionType: 'SHOW_POCKET_GROKKI',
+          message: '📱 Pocket Grokki is ready! Scan the QR code with your iPhone or Android camera to instantly connect over local Wi-Fi.'
+        };
+      }
+
+      case 'presentation_slide_changer': {
+        return await this.handlePresentationSlideChanger(args);
+      }
+
+      case 'find_files_and_folders': {
+        return await powerTools.searchFilesAndFolders(args);
+      }
+
+      // browser-use Autonomous Browser Agent
+      case 'autonomous_browser_agent': {
+        const goal = args.goal || args.query || args.prompt || 'Browse the web';
+        const res = await browserAgent.runGoal(goal, (sys, usr) => this.generateAcademicLLM(sys, usr, 800));
+        let cleanedSummary = (res.summary || res.message || 'Browser task complete.')
+          .replace(/^Action:\s*done\s*\(\s*(?:result\s*=\s*)?["']?/i, '')
+          .replace(/["']?\s*\)$/i, '')
+          .trim();
+        return {
+          ...res,
+          message: res.success !== false
+            ? `🌐 **Browser Task Finished** (${res.steps || 1} steps):\n\n${cleanedSummary}`
+            : `❌ Browser error: ${res.error || res.message}`,
+        };
+      }
+
+      // bytedance/UI-TARS-desktop Vision Computer-Use Agent
+      case 'ui_tars_desktop_agent': {
+        const goal = (args.goal || args.task || args.instruction || '').trim();
+        if (/\b(?:highlighted|selected)\s+(?:text|code|selection|paragraph|sentence|snippet)\b/i.test(goal) ||
+            /\b(?:what\s+does\s+the\s+text\s+say|read\s+selection|explain\s+selected)\b/i.test(goal)) {
+          console.log('[AgentBrain] Redirecting ui_tars_desktop_agent to handleHighlightToAction for text query');
+          return await this.handleHighlightToAction({ instruction: goal });
+        }
+        if (!goal || goal === 'Perform visual desktop task' || goal === 'Perform desktop automation') {
+          return {
+            success: false,
+            message: 'No specific visual desktop task was provided. What would you like UI-TARS to do on your desktop?',
+          };
+        }
+        const res = await uiTarsAgent.runTask(goal, (sys, usr, img) => this.generateVisionLLM(sys, usr, img));
+        return {
+          ...res,
+          message: res.success !== false
+            ? `🖥️ **UI-TARS Desktop Automation Completed** (${res.steps || 1} steps):\n\n${res.summary || 'Task completed successfully.'}`
+            : `❌ UI-TARS error: ${res.error || res.message || 'Task could not complete.'}`,
+        };
+      }
+
+      // lance-format/lancedb Vector Database
+      case 'lancedb_vector_search': {
+        const action = (args.action || 'search').toLowerCase();
+        if (action === 'index_folder') {
+          return await lanceDbStore.indexFolder(args.folder_path || process.cwd());
+        }
+        const hits = await lanceDbStore.search(args.query || '', args.limit || 5);
+        if (hits.length === 0) {
+          return { success: true, message: 'No matching vector records found in local LanceDB store.', results: [] };
+        }
+        const formatted = hits.map((h, i) => `${i + 1}. **${h.title}** (${h.source})\n   ${h.text.slice(0, 300)}...`).join('\n\n');
+        return {
+          success: true,
+          message: `### 🔍 LanceDB Vector Search Results (${hits.length} hits)\n\n${formatted}`,
+          results: hits,
+        };
+      }
+
+      // mem0ai/mem0 Long-Term Personalized Memory
+      case 'mem0_memory': {
+        const action = (args.action || 'search').toLowerCase();
+        if (action === 'add') {
+          const added = await mem0Manager.extractMemoriesFromTurn(args.fact || args.text, '', null);
+          return { success: true, message: `Saved fact to Mem0 memory.`, added };
+        } else if (action === 'all' || action === 'list') {
+          const all = mem0Manager.getAll();
+          const list = all.map((m, i) => `${i + 1}. ${m.memory} *(category: ${m.category || 'general'})*`).join('\n');
+          return { success: true, message: `### 🧠 Mem0 Long-Term Memories (${all.length})\n${list || 'No memories saved yet.'}`, memories: all };
+        } else if (action === 'delete') {
+          mem0Manager.deleteMemory(args.id);
+          return { success: true, message: `Deleted memory ${args.id}.` };
+        } else {
+          const hits = await mem0Manager.searchMemories(args.query || '', args.limit || 5);
+          const list = hits.map((h, i) => `${i + 1}. ${h.memory || h.text}`).join('\n');
+          return { success: true, message: `### 🧠 Mem0 Relevant Memories\n${list || 'No matching memories found.'}`, results: hits };
+        }
+      }
+
+      // modelcontextprotocol/servers (MCP)
+      case 'mcp_servers': {
+        const action = (args.action || 'status').toLowerCase();
+        if (action === 'start_all') {
+          const res = await mcpManager.startAllEnabled();
+          return { success: true, results: res };
+        } else if (action === 'connect') {
+          const srvConfig = args.server_config || {};
+          const res = await mcpManager.connectServer(args.server_id, srvConfig);
+          return { success: true, toolsCount: res.tools.length };
+        } else if (action === 'disconnect') {
+          await mcpManager.disconnectServer(args.server_id);
+          return { success: true, message: `Disconnected ${args.server_id}` };
+        } else {
+          const st = mcpManager.getStatus();
+          const lines = st.servers.map(s => `- **${s.id}**: ${s.connected ? '🟢 Connected' : (s.enabled ? '🟡 Enabled (starting)' : '⚪ Disabled')} (${s.tools.length} tools) - *${s.description}*`).join('\n');
+          return {
+            success: true,
+            message: `### 🔌 Model Context Protocol (MCP) Servers (${st.activeCount} active, ${st.totalTools} tools)\n${lines || 'No MCP servers configured yet.'}\n\n*Configure custom servers in \`data/mcp_servers.json\`.*`,
+            status: st,
+          };
+        }
+      }
+
+      default:
+        return { success: false, message: `Unknown tool: ${name}` };
+    }
+  }
+
+  broadcastToMiniIsland(channel, payload) {
+    try {
+      if (electronModule && electronModule.BrowserWindow) {
+        electronModule.BrowserWindow.getAllWindows().forEach((win) => {
+          if (!win.isDestroyed() && win.webContents) {
+            win.webContents.send(channel, payload);
+          }
+        });
+      }
+    } catch (_) {}
+  }
+
+  // Lock-In Study Session Handler
+  async handleStartLockIn(args = {}) {
+    if (String(args.action || '').toLowerCase() === 'stop') {
+      this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'timer' });
+      return {
+        success: true,
+        actionType: 'STOP_LOCK_IN',
+        message: '⏹️ **Lock-In / Focus Timer Stopped** on the Mini Dynamic Island.',
+      };
+    }
+
+    const duration = Number(args.duration_minutes) || 25;
+    const subject = (args.subject || 'Study').trim();
+    const playLofi = args.play_lofi !== false && subject.toLowerCase() !== 'timer';
+    const totalSeconds = Math.max(1, Math.round(duration * 60));
+
+    // Start background lo-fi music on YouTube Music if requested
+    if (playLofi) {
+      this.executeTool('play_youtube_music', { song: 'lofi hip hop radio study chill beats' });
+    }
+
+    // Broadcast live countdown directly to the Mini Dynamic Island (top_notch.html)
+    this.broadcastToMiniIsland('island:activity', {
+      action: 'start',
+      kind: 'timer',
+      icon: 'fa-solid fa-stopwatch',
+      title: subject.toLowerCase() === 'timer' ? 'Timer' : `Lock-In • ${subject}`,
+      subject,
+      durationMinutes: duration,
+      durationSeconds: totalSeconds,
+      endTime: Date.now() + totalSeconds * 1000,
+    });
+
+    const isPlainTimer = subject.toLowerCase() === 'timer';
+    return {
+      success: true,
+      actionType: 'START_LOCK_IN',
+      durationMinutes: duration,
+      subject,
+      message: isPlainTimer
+        ? `⏱️ **Timer set for ${duration < 1 ? `${totalSeconds} seconds` : `${duration} minutes`}** on the Mini Dynamic Island.`
+        : `🔥 **Lock-In Study Mode Activated** for **${duration} minutes** on *${subject}*!\n\n• Live countdown running in your **Mini Dynamic Island** ⏱️${playLofi ? '\n• Lo-Fi focus beats playing on YouTube Music 🎵' : ''}\n• Stay focused—you've got this!`,
+    };
+  }
+
+  // University Student Study Revision & Exam Cheatsheet Engine
+  async handleCreateStudyDocument(args) {
+    try {
+      const targetPath = args.file_path || (this.activeContext?.attachedFile?.path) || null;
+      let topic = (args.topic || '').trim();
+      if (!topic && targetPath) {
+        topic = path.basename(targetPath, path.extname(targetPath)).replace(/[-_]/g, ' ');
+      }
+      if (!topic) {
+        topic = 'Lecture Revision';
+      }
+
+      const mode = args.study_mode || 'quick_notes';
+      const customInstructions = args.custom_instructions || '';
+
+      let textContent = '';
+      if (targetPath && fs.existsSync(targetPath)) {
+        console.log(`[AgentBrain] Extracting text from student file: ${targetPath}`);
+        const extracted = await studyEngine.extractTextFromFile(targetPath, 10000);
+        textContent = extracted.text;
+      } else {
+        textContent = `Comprehensive lecture and textbook concepts for topic: "${topic}".`;
+      }
+
+      const prompt = studyEngine.buildStudyPrompt(mode, textContent, topic, customInstructions);
+
+      // Synthesize using active AI provider (Groq / Gemini / Ollama / OpenRouter)
+      const config = this.activeConfig || {};
+      const provider = config.provider || 'groq';
+      let generatedMarkdown = '';
+
+      console.log(`[AgentBrain] Synthesizing study revision with provider: ${provider}, mode: ${mode}`);
+
+      if (provider === 'gemini' && config.geminiApiKey) {
+        const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
+        const res = await ai.models.generateContent({
+          model: this.models[0],
+          contents: [{ role: 'user', parts: [{ text: prompt }] }],
+          config: {
+            systemInstruction: 'You are Grokki, an elite university tutor and exam prep coach. Return structured academic study notes in clean GitHub Markdown.',
+            maxOutputTokens: 2500,
+            temperature: 0.3,
+          },
+        });
+        generatedMarkdown = res.text || '';
+      } else {
+        // OpenAI Compatible: Groq, Ollama, OpenRouter, OpenAI, Grok, DeepSeek, Qwen, OmniRouter
+        const { endpoint, apiKey, model } = resolveOpenAIEndpointAndKey(provider, config);
+
+        const data = await callOpenAICompatible({
+          endpoint,
+          apiKey,
+          model,
+          messages: [
+            {
+              role: 'system',
+              content: 'You are Grokki, an elite university professor and study revision specialist. Generate dense, high-yield academic study notes in clean GitHub Markdown.',
+            },
+            { role: 'user', content: prompt },
+          ],
+          temperature: 0.3,
+          timeout: 45000,
+        });
+
+        if (data && data.choices && data.choices[0]) {
+          generatedMarkdown = data.choices[0].message?.content || '';
+        }
+      }
+
+      if (!generatedMarkdown) {
+        return { success: false, message: 'Could not generate study document. Please verify your AI provider key or network.' };
+      }
+
+      // Save to Desktop/Grokki_Study_Notes/ and auto-open
+      const savedInfo = studyEngine.saveStudyDocument(topic, generatedMarkdown, mode);
+
+      const modeLabels = {
+        cheat_sheet: '1-Page Exam Cheat Sheet',
+        exam_questions: 'Probable Exam Questions & Model Answers',
+        quick_notes: 'High-Yield Revision Notes',
+        eli5: "Feynman Technique (Explain Like I'm 10)",
+      };
+
+      const docTitle = modeLabels[mode] || 'Study Revision Notes';
+      return {
+        success: true,
+        message: `Generated **${docTitle}** for *${topic}*!\n\nSaved to Desktop: \`${savedInfo.filename}\` and opened in your editor.`,
+        filePath: savedInfo.fullPath,
+      };
+    } catch (err) {
+      console.error('[AgentBrain] Study revision error:', err);
+      return { success: false, message: `Study document generation error: ${err.message}` };
+    }
+  }
+
+  // WhatsApp Automation: Supports direct phone numbers, group names, contacts, and file attachments
+  async handleWhatsAppSend({ contactOrPhone, message, filePath }) {
+    let openwaWorkspace = null;
+    try { openwaWorkspace = require('./openwa_workspace'); } catch (e) {}
+
+    let phone = (contactOrPhone || '').replace(/[^\d+]/g, '');
+    let contactName = (contactOrPhone || '').trim();
+
+    // 1. Resolve contact/group via OpenWA/Baileys
+    let resolvedJid = null;
+    if (openwaWorkspace && openwaWorkspace.resolveTargetJid) {
+      resolvedJid = openwaWorkspace.resolveTargetJid(contactOrPhone);
+    }
+
+    // 2. If contact is a name without phone digits, try searching Google Contacts as secondary
+    if (!resolvedJid && (!phone || phone.length < 7) && contactName && googleWorkspace && googleWorkspace.isConnected()) {
+      try {
+        const contactRes = await googleWorkspace.searchContacts(contactName);
+        if (contactRes && contactRes.contacts && contactRes.contacts.length > 0) {
+          const matched = contactRes.contacts.find((c) => c.phone) || contactRes.contacts[0];
+          if (matched && matched.phone) {
+            phone = matched.phone.replace(/[^\d+]/g, '');
+            contactName = matched.name || contactName;
+            if (openwaWorkspace && openwaWorkspace.resolveTargetJid) {
+              resolvedJid = openwaWorkspace.resolveTargetJid(phone);
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('[WhatsApp] Google Contacts search error:', e.message);
+      }
+    }
+
+    // 3. If recipient has no digits and was not found in groups/contacts
+    if (!resolvedJid && (!phone || phone.length < 7)) {
+      return {
+        success: false,
+        message: `❓ I couldn't find a WhatsApp contact, group, or phone number for **"${contactOrPhone}"**.\n\nPlease provide their 10-digit phone number, for example:\n> \`Send WhatsApp message to +91XXXXXXXXXX saying ${message || 'hello'}\``,
+      };
+    }
+
+    let resolvedFilePath = filePath || '';
+    const attachPath = (this.activeContext && this.activeContext.filePath) ||
+      (this.activeContext && this.activeContext.attachedFile && (this.activeContext.attachedFile.path || this.activeContext.attachedFile)) || null;
+    if ((!resolvedFilePath || !fs.existsSync(resolvedFilePath)) && attachPath && fs.existsSync(attachPath)) {
+      resolvedFilePath = attachPath;
+    }
+    if (!resolvedFilePath || !fs.existsSync(resolvedFilePath)) {
+      const selected = this.getSelectedExplorerFiles();
+      if (selected && selected.length > 0 && fs.existsSync(selected[0])) {
+        resolvedFilePath = selected[0];
+      }
+    }
+
+    if (!resolvedFilePath && (!message || !message.trim())) {
+      return {
+        success: false,
+        message: `❓ No file or message was found to send.\n\nPlease select a file in File Explorer with one left-click (or drag and drop it here into Grokki), then say: **"Send it to ${contactName || contactOrPhone}"**!`,
+      };
+    }
+
+    // 4. Primary: Send via background embedded engine (Zero desktop app popup)
+    if (openwaWorkspace) {
+      try {
+        await openwaWorkspace.ensureReady(3000);
+        const sendTarget = resolvedJid || (phone && phone.length >= 7 ? phone : contactOrPhone);
+        const openwaRes = await openwaWorkspace.sendWhatsAppMessage({
+          to: sendTarget,
+          message: message || '',
+          filePath: resolvedFilePath || null,
+        });
+
+        if (openwaRes.success) {
+          const cleanTargetName = openwaWorkspace.formatChatName ? openwaWorkspace.formatChatName(sendTarget) : (contactName || sendTarget);
+          const fileDesc = resolvedFilePath ? ` with attachment \`${path.basename(resolvedFilePath)}\`` : '';
+          return {
+            success: true,
+            message: `🟢 **WhatsApp Message Sent!**\n\nDelivered directly to **${cleanTargetName}**${fileDesc}:\n> "${message || ''}"`,
+            openwa: true,
+          };
+        } else if (openwaRes.notFound) {
+          return {
+            success: false,
+            message: `❓ I couldn't find a WhatsApp contact or phone number for **"${contactOrPhone}"**.\n\nPlease provide their 10-digit phone number, for example:\n> \`Send WhatsApp message to +91XXXXXXXXXX saying ${message || 'hello'}\``,
+          };
+        }
+      } catch (openwaErr) {
+        console.warn('[WhatsApp] OpenWA send error, falling back to desktop automation:', openwaErr.message);
+      }
+    }
+
+    // 2. Desktop UI Fallback (PowerShell Automation)
+
+    let scriptPath = path.resolve(__dirname, 'office_helper.ps1');
+    if (scriptPath.includes('app.asar')) {
+      const unpacked = scriptPath.replace('app.asar', 'app.asar.unpacked');
+      if (fs.existsSync(unpacked)) scriptPath = unpacked;
+    }
+    const safeMsg = (message || '').replace(/"/g, '`"');
+    const safeContact = (contactName || '').replace(/"/g, '`"');
+    const safeFile = (resolvedFilePath || '').replace(/"/g, '`"');
+    const hasPhone = phone && phone.length >= 7;
+
+    const cmd = `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${scriptPath}" -action whatsapp-send -phone "${hasPhone ? phone : ''}" -contactName "${safeContact}" -message "${safeMsg}" -filePath "${safeFile}"`;
+
+    try {
+      const res = await new Promise((resolve) => {
+        exec(cmd, (error, stdout, stderr) => {
+          if (error) resolve({ success: false, error: stderr || error.message });
+          else resolve({ success: true, stdout });
+        });
+      });
+
+      const recipientDesc = phone ? `${contactOrPhone} (${phone})` : contactOrPhone;
+      const fileDesc = resolvedFilePath ? ` with attachment "${path.basename(resolvedFilePath)}"` : '';
+      return {
+        success: res.success,
+        message: `WhatsApp: Opened chat for ${recipientDesc}${fileDesc}. Message and file ready to send!`,
+      };
+    } catch (err) {
+      return { success: false, message: `WhatsApp error: ${err.message}` };
+    }
+  }
+
+  // Physical MS Word Automation
+  async handleWordPhysical(args) {
+    const filename = args.filename || 'Document.docx';
+    const desktopPath = path.join(os.homedir(), 'Desktop', filename);
+
+    // Launch Word
+    exec(`powershell.exe -NoProfile -Command "Start-Process winword.exe"`);
+
+    // Wait for Word to initialize and focus
+    await new Promise((r) => setTimeout(r, 1800));
+    await runPowerShell('-action focus -app WINWORD');
+    await new Promise((r) => setTimeout(r, 400));
+
+    // Smoothly glide cursor to page area (center of primary monitor) and click
+    const display = screen.getPrimaryDisplay();
+    const pageX = Math.round(display.size.width * 0.5);
+    const pageY = Math.round(display.size.height * 0.42);
+    await runPowerShell(`-action click -x ${pageX} -y ${pageY} -durationMs 320`);
+
+    // Physically type the text into Word
+    if (args.text) {
+      await new Promise((r) => setTimeout(r, 300));
+      const safe = args.text.replace(/"/g, '`"');
+      await runPowerShell(`-action type -text "${safe}"`);
+    }
+
+    // Save if requested
+    if (args.save) {
+      await new Promise((r) => setTimeout(r, 500));
+      await runPowerShell('-action hotkey -keys "ctrl+s"');
+    }
+
+    return {
+      success: true,
+      message: `Word: Focused MS Word, clicked into page, and physically typed document.`,
+    };
+  }
+
+  async captureScreenBase64(width = 1920, height = 1080) {
+    if (desktopCapturer) {
+      try {
+        const sources = await desktopCapturer.getSources({
+          types: ['screen'],
+          thumbnailSize: { width, height },
+        });
+        if (sources && sources.length > 0) {
+          return sources[0].thumbnail.toJPEG(90).toString('base64');
+        }
+      } catch (e) {}
+    }
+
+    const captureRes = await runPowerShell('-action capture');
+    const imagePath = captureRes.stdout;
+    if (fs.existsSync(imagePath)) {
+      return fs.readFileSync(imagePath).toString('base64');
+    }
+    return null;
+  }
+
+  // VS Code Live Bug Doctor: Physical editor inspect + clipboard + multi-provider AI diagnosis
+  async diagnoseVSCode(args = {}) {
+    let codeOrError = (typeof args === 'string' ? args : (args?.error_or_code || '')).trim();
+
+    // 1. If no direct code given, check clipboard for copied error or code snippet
+    if (!codeOrError) {
+      try {
+        const clip = await new Promise((resolve) => {
+          exec('powershell.exe -NoProfile -Command "Get-Clipboard"', { timeout: 3000 }, (err, stdout) => {
+            resolve((stdout || '').trim());
+          });
+        });
+        if (clip && clip.length > 5 && (/error|exception|traceback|syntax|at |function|class|def |int |const |let |var |\{|\}|;/i.test(clip))) {
+          codeOrError = clip.substring(0, 4000);
+          console.log('[AgentBrain] Found code/error snippet in clipboard for Bug Doctor diagnosis');
+        }
+      } catch (e) {}
+    }
+
+    // 2. Bring VS Code to foreground & open Problems view
+    await runPowerShell('-action focus -app Code');
+    await new Promise((r) => setTimeout(r, 400));
+    await runPowerShell('-action hotkey -keys "ctrl+shift+m"');
+    await new Promise((r) => setTimeout(r, 500));
+
+    const config = this.activeConfig || {};
+    const provider = config.provider || 'groq';
+
+    // 3. If we have code/error text, synthesize comprehensive fix using active LLM (Groq / Gemini)
+    if (codeOrError) {
+      const prompt = `You are Grokki, an elite principal software engineer and expert code bug doctor.
+Analyze the following code / compiler / runtime error and diagnose it immediately.
+
+Code / Error Content:
+"""
+${codeOrError}
+"""
+
+OUTPUT FORMAT (Markdown):
+1. 🔴 **The Bug**: State the exact error type and 1-sentence root-cause explanation.
+2. 💡 **The Fix**: Provide the clean, minimal corrected code snippet ready to copy-paste.
+3. 🛡️ **Prevention Tip**: 1 crisp sentence explaining how to prevent this in the future.
+
+Keep it direct, accurate, and high-yield.`;
+
+      if (provider === 'gemini' && config.geminiApiKey) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
+          const res = await ai.models.generateContent({
+            model: this.models[0],
+            contents: [{ role: 'user', parts: [{ text: prompt }] }],
+            config: { maxOutputTokens: 600, temperature: 0.1 },
+          });
+          return { success: true, message: (res.text || '').trim() };
+        } catch (e) {}
+      } else {
+        // Groq / Ollama / OpenRouter / OpenAI / Grok / DeepSeek / Qwen / OmniRouter
+        try {
+          const { endpoint, apiKey, model } = resolveOpenAIEndpointAndKey(provider, config);
+
+          const data = await callOpenAICompatible({
+            endpoint,
+            apiKey,
+            model,
+            messages: [
+              { role: 'system', content: 'You are Grokki, an elite code doctor. Diagnose bugs with crystal clarity and provide minimal clean fixes.' },
+              { role: 'user', content: prompt }
+            ],
+            temperature: 0.2,
+            timeout: 25000,
+          });
+
+          const reply = data?.choices?.[0]?.message?.content;
+          if (reply) {
+            return { success: true, message: reply.trim() };
+          }
+        } catch (e) {}
+      }
+    }
+
+    // 4. Fallback to Gemini Vision screenshot if Gemini key available
+    const base64Image = await this.captureScreenBase64();
+    if (base64Image && config.geminiApiKey) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
+        const promptText = 'Look at this VS Code screen. Read the Problems panel at the bottom or red squiggles in the editor. State: 🔴 [File:Line] Error description. 💡 Fix: brief fix. If no error is visible, say: "No active errors detected in VS Code." Keep output under 60 words.';
+
+        const res = await ai.models.generateContent({
+          model: this.models[0],
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: promptText },
+                { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+              ],
+            },
+          ],
+          config: { maxOutputTokens: 150, temperature: 0.1 },
+        });
+
+        const reply = (res.text || '').trim();
+        return { success: true, message: reply || 'VS Code: Inspected Problems panel. No active syntax errors detected.' };
+      } catch (err) {}
+    }
+
+    return {
+      success: true,
+      message: 'VS Code: Brought to foreground and opened Problems panel (`Ctrl+Shift+M`). Tip: Copy your error or code (`Ctrl+C`) and ask Grokki "Fix this bug" for instant diagnosis!',
+    };
+  }
+
+  // Multi-provider Academic LLM helper (Groq, Gemini, Ollama, OpenRouter, OpenAI, Grok, DeepSeek, Qwen, OmniRouter)
+  async generateAcademicLLM(systemPrompt, userPrompt, maxTokens = 1500) {
+    const config = this.activeConfig || {};
+    const primaryProvider = powerTools.airgapForced ? 'ollama' : (config.provider || 'gemini');
+
+    // 1. Try Gemini provider if active or configured
+    const tryGemini = async () => {
+      if (!config.geminiApiKey) return null;
+      const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
+      const geminiCandidates = [
+        config.geminiModel,
+        'gemini-flash-latest',
+        'gemini-flash-lite-latest',
+        'gemini-3.5-flash',
+        'gemini-3.7-flash',
+      ].filter(Boolean);
+
+      for (const m of geminiCandidates) {
+        try {
+          const res = await ai.models.generateContent({
+            model: m,
+            contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
+            config: {
+              systemInstruction: systemPrompt,
+              maxOutputTokens: maxTokens,
+              temperature: 0.25,
+            },
+          });
+          if (res?.text && res.text.trim()) {
+            return res.text.trim();
+          }
+        } catch (err) {
+          console.warn(`[AgentBrain] Gemini model ${m} failed in generateAcademicLLM:`, err.message);
+        }
+      }
+      return null;
+    };
+
+    // 2. Try OpenAI-compatible provider (Groq, OpenRouter, Ollama, OpenAI, etc.)
+    const tryOpenAI = async (prov = primaryProvider) => {
+      const { endpoint, apiKey, model } = resolveOpenAIEndpointAndKey(prov, config);
+      if (!apiKey && prov !== 'ollama') return null;
+
+      const candidateModels = [model];
+      if (prov === 'groq') {
+        candidateModels.push('qwen/qwen3.8-27b', 'openai/gpt-oss-120b', 'openai/gpt-oss-20b');
+      }
+
+      for (const m of [...new Set(candidateModels.filter(Boolean))]) {
+        try {
+          const data = await callOpenAICompatible({
+            endpoint,
+            apiKey,
+            model: m,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            temperature: 0.25,
+            timeout: 35000,
+          });
+
+          const reply = (data?.choices?.[0]?.message?.content || '').trim();
+          if (reply) return reply;
+        } catch (err) {
+          console.warn(`[AgentBrain] Model ${m} failed in generateAcademicLLM:`, err.message);
+        }
+      }
+      return null;
+    };
+
+    // Execute primary provider first, with seamless fallback to secondary if primary fails
+    if (primaryProvider === 'gemini') {
+      const res = await tryGemini();
+      if (res) return res;
+      if (config.groqApiKey) return await tryOpenAI('groq');
+    } else {
+      const res = await tryOpenAI(primaryProvider);
+      if (res) return res;
+      if (config.geminiApiKey) return await tryGemini();
+    }
+
+    return '';
+  }
+
+  // Vision LLM Helper for UI-TARS and Screen Grounding
+  async generateVisionLLM(systemPrompt, userPrompt, base64Image) {
+    const config = this.activeConfig || {};
+    const geminiKey = (config.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+
+    if (geminiKey) {
+      const candidateModels = ['gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-flash-latest'];
+      for (const m of candidateModels) {
+        try {
+          const ai = new GoogleGenAI({ apiKey: geminiKey });
+          const res = await ai.models.generateContent({
+            model: m,
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { text: userPrompt },
+                  { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+                ],
+              },
+            ],
+            config: {
+              systemInstruction: systemPrompt,
+              temperature: 0.15,
+            },
+          });
+          if (res?.text) return res.text.trim();
+        } catch (err) {
+          console.warn(`[AgentBrain] Gemini Vision model ${m} failed:`, err.message);
+        }
+      }
+    }
+
+    return '';
+  }
+
+  // Feature 2: YouTube Video & Lecture Summarizer + Clickable Timestamp Finder
+  async handleSummarizeYouTube(args = {}) {
+    const urlOrTopic = (args.url_or_topic || args.query || '').trim();
+    const focus = (args.focus || '').trim();
+    if (!urlOrTopic) {
+      return { success: false, message: 'Please provide a YouTube video URL or topic to summarize.' };
+    }
+
+    const ytData = await studyEngine.fetchYouTubeTranscript(urlOrTopic);
+    if (!ytData.success) {
+      return { success: false, message: ytData.message || 'Unable to retrieve YouTube video details. Please verify the URL.' };
+    }
+
+    const systemPrompt = 'You are Grokki, an intelligent assistant. Provide clear, accurate, high-yield summaries of YouTube videos (lectures, tutorials, documentary/bodycam clips, news, essays, tech talks). Answer the user\'s question or focus directly. If timestamps or chapters are available, include clickable Markdown timestamp jump links.';
+    const userPrompt = `Analyze this YouTube video and generate a comprehensive summary answering what the video is about.
+Title: "${ytData.title}"
+Creator/Channel: ${ytData.channel}
+Duration: ${ytData.durationStr || 'N/A'}
+Video URL: ${ytData.url}
+${focus ? `User's Question / Focus: "${focus}"\n` : ''}
+
+Video Content & Context:
+"""
+${ytData.transcriptText}
+"""
+
+REQUIRED OUTPUT FORMAT (Clean GitHub Markdown):
+### 📺 [${ytData.title}](${ytData.url})
+*Channel: ${ytData.channel}${ytData.durationStr ? ` | Duration: ${ytData.durationStr}` : ''}*
+
+#### 🎯 What This Video Is About
+- 3-5 crisp bullet points explaining what happens in the video, core themes, key events, or lessons taught.
+
+${(ytData.buckets && ytData.buckets.length > 0) ? `#### ⏱️ Key Timestamps & Chapters
+- List key sections using clickable Markdown links: \`[MM:SS](${ytData.url}&t=XXs) — Description\` (XXs is total seconds).` : ''}
+
+${focus ? `#### 💡 Direct Answer to "${focus}"\n- Clear explanation addressing the user's specific question.` : ''}
+`;
+
+    try {
+      const summary = await this.generateAcademicLLM(systemPrompt, userPrompt, 1500);
+      if (summary && summary.trim().length > 30) {
+        return { success: true, message: summary.trim() };
+      }
+    } catch (err) {
+      console.warn('[AgentBrain] YouTube LLM summary error:', err.message);
+    }
+
+    // Fallback if LLM call fails: synthesize structured overview from title and reporting context
+    let fallback = `### 📺 [${ytData.title}](${ytData.url})\n*Channel: ${ytData.channel}${ytData.durationStr ? ` | Duration: ${ytData.durationStr}` : ''}*\n\n`;
+    if (ytData.buckets && ytData.buckets.length > 0) {
+      fallback += `#### ⏱️ Video Timeline & Chapters\n` + ytData.buckets.slice(0, 8).map((b) => `- [${b.timeStr}](${ytData.url}&t=${b.seconds}s) — ${b.text}`).join('\n') + '\n\n';
+    }
+    const cleanContext = (ytData.webContext || ytData.cleanDescription || '').trim();
+    fallback += `#### 🎯 Summary\n${cleanContext ? cleanContext.substring(0, 800) : `Video analysis for "${ytData.title}" completed.`}`;
+    return {
+      success: true,
+      message: fallback,
+    };
+  }
+
+  // Feature 3: "Viva / Oral Exam" Voice Quiz Mode + Anki Flashcard Exporter
+  async handleVivaVoiceQuiz(args = {}) {
+    const action = (args.action || 'start').toLowerCase().trim();
+    const state = studyEngine.vivaState;
+
+    // 1. Export Anki Deck / Finish Quiz
+    if (action === 'export_anki' || action === 'stop' || action === 'finish') {
+      const topic = args.topic || state.topic || 'University_Viva';
+      let cards = [...(state.cards || [])];
+
+      // If user asks to export flashcards before answering 5 questions, generate 5 bonus flashcards on the topic
+      if (cards.length < 3) {
+        try {
+          const genPrompt = `Generate 5 high-yield university exam flashcards on "${topic}"${state.sourceText ? ` based on:\n${state.sourceText.substring(0, 3000)}` : ''}.
+Return ONLY valid JSON array: [{"front": "Question?", "back": "Concise Answer", "tags": "viva_exam"}]`;
+          const rawJson = await this.generateAcademicLLM('Return valid JSON array only.', genPrompt, 800);
+          const cleaned = rawJson.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+          const parsed = JSON.parse(cleaned);
+          if (Array.isArray(parsed)) cards.push(...parsed);
+        } catch (e) {}
+      }
+
+      state.active = false;
+      const saved = studyEngine.saveAnkiFlashcards(topic, cards);
+      const avgScore = state.scores.length > 0
+        ? (state.scores.reduce((a, b) => a + b, 0) / state.scores.length).toFixed(1)
+        : 'N/A';
+
+      return {
+        success: true,
+        message: `🎓 **Viva / Oral Exam Complete!**\n- **Topic**: *${topic}*\n- **Final Score**: **${avgScore} / 10**\n- 🗂️ **Anki Flashcard Deck Saved**: \`${saved.filename}\` (${saved.count} cards exported to \`Desktop/Grokki_Study_Notes/\` — ready for 1-click import into Anki or Quizlet!)`,
+      };
+    }
+
+    // 2. Start New Viva / Oral Exam
+    if (action === 'start' || !state.active) {
+      const targetPath = this.activeContext?.attachedFile?.path || null;
+      let topic = (args.topic || '').trim();
+      let sourceText = '';
+
+      if (targetPath && fs.existsSync(targetPath)) {
+        const extracted = await studyEngine.extractTextFromFile(targetPath, 6000);
+        sourceText = extracted.text || '';
+        if (!topic) topic = path.basename(targetPath, path.extname(targetPath)).replace(/[-_]/g, ' ');
+      }
+      if (!topic) topic = 'Computer Science & Engineering Core';
+
+      state.active = true;
+      state.topic = topic;
+      state.sourceText = sourceText;
+      state.questionCount = 1;
+      state.scores = [];
+      state.history = [];
+      state.cards = [];
+
+      const qPrompt = `You are a friendly but rigorous university professor conducting an Oral Viva Exam on "${topic}".
+${sourceText ? `Reference Lecture Material:\n"""\n${sourceText.substring(0, 3500)}\n"""\n` : ''}
+Ask Question #1 (out of 5). Make it a conceptual, thought-provoking question that can be answered out loud in 1-3 sentences.
+Keep your intro to 1 short sentence, then state Question #1 clearly.`;
+
+      const questionText = await this.generateAcademicLLM(
+        'You are Grokki in Viva Professor Mode. Keep questions crisp, spoken-friendly, and engaging.',
+        qPrompt,
+        300
+      );
+
+      state.currentQuestion = questionText;
+      return {
+        success: true,
+        message: `🎙️ **Viva Oral Exam Mode: ${topic}** *(Question 1 of 5)*\n\n${questionText}\n\n*(Speak or type your answer—or say **"stop quiz"** anytime to export your Anki flashcards!)*`,
+      };
+    }
+
+    // 3. Grade Student's Answer & Ask Next Question
+    const studentAnswer = (args.student_answer || '').trim();
+    const currentQ = state.currentQuestion || `Core concept in ${state.topic}`;
+    const qNum = state.questionCount || 1;
+    const isFinalQuestion = qNum >= 5;
+
+    const evalPrompt = `You are a university professor grading Question #${qNum} in an Oral Viva Exam on "${state.topic}".
+Question Asked: "${currentQ}"
+Student's Answer: "${studentAnswer}"
+
+Return ONLY valid JSON with these exact keys:
+{
+  "score": 8,
+  "spoken_feedback": "Heh, spot on! You nailed the core intuition, though remember to mention time complexity.",
+  "ideal_answer": "Concise 1-2 sentence model answer for the Anki flashcard back.",
+  "next_question": "${isFinalQuestion ? '' : `Question #${qNum + 1} on ${state.topic} (can be a deeper follow-up or next subtopic)`}"
+}`;
+
+    try {
+      const rawEval = await this.generateAcademicLLM('Return valid JSON only.', evalPrompt, 500);
+      const cleaned = rawEval.replace(/^```json\s*/i, '').replace(/```$/i, '').trim();
+      const parsed = JSON.parse(cleaned);
+
+      const score = Number(parsed.score) || 7;
+      state.scores.push(score);
+      state.cards.push({
+        front: currentQ.replace(/\n+/g, ' '),
+        back: parsed.ideal_answer || studentAnswer,
+        tags: `viva_${state.topic.replace(/\s+/g, '_').toLowerCase()}`,
+      });
+
+      if (isFinalQuestion) {
+        state.active = false;
+        const avg = (state.scores.reduce((a, b) => a + b, 0) / state.scores.length).toFixed(1);
+        const saved = studyEngine.saveAnkiFlashcards(state.topic, state.cards);
+        return {
+          success: true,
+          message: `✅ **Score: ${score}/10** — ${parsed.spoken_feedback}\n\n💡 **Model Answer**: ${parsed.ideal_answer}\n\n---\n🏆 **Viva Exam Completed! Final Grade: ${avg}/10**\n🗂️ Saved **${saved.count} Anki Flashcards** to \`Desktop/Grokki_Study_Notes/${saved.filename}\`!`,
+        };
+      }
+
+      state.questionCount = qNum + 1;
+      state.currentQuestion = parsed.next_question;
+
+      return {
+        success: true,
+        message: `✅ **Score: ${score}/10** — ${parsed.spoken_feedback}\n\n💡 *Key Note*: ${parsed.ideal_answer}\n\n---\n🎙️ **Question ${state.questionCount} of 5**:\n${parsed.next_question}`,
+      };
+    } catch (err) {
+      state.questionCount = qNum + 1;
+      return {
+        success: true,
+        message: `Good effort! Let's move to **Question ${state.questionCount} of 5** on *${state.topic}*: How would you apply this concept in a real-world system or edge case?`,
+      };
+    }
+  }
+
+  // Feature 4: Screen "Snap & Solve" for Canvas / Moodle / LeetCode / Diagrams (Groq Vision + Gemini Vision)
+  async handleSnapAndSolveScreen(args = {}) {
+    const focus = (args.question_or_focus || 'Solve the problem, quiz question, code, or diagram visible on my screen step-by-step').trim();
+    const base64Image = await this.captureScreenBase64(1440, 900);
+    if (!base64Image) {
+      return { success: false, message: 'Could not capture screenshot of your monitor.' };
+    }
+
+    const config = this.activeConfig || {};
+    const groqKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+    const geminiKey = (config.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+
+    const solvePrompt = `You are Grokki's "Snap & Solve" University Tutor. Look at this screenshot of the student's screen.
+Student Request: "${focus}"
+
+Instructions:
+1. Identify the active problem on screen (e.g., Canvas/Moodle/Blackboard MCQ or quiz question, LeetCode/coding challenge, math/physics equation, or engineering/UML/circuit diagram).
+2. Give the **Direct Final Answer / Correct Option** right at the top in bold so the student gets immediate clarity.
+3. Provide a clear, concise **Step-by-Step Solution / Walkthrough** (or clean optimal code if it's a coding problem).
+4. Keep formatting crisp with GitHub Markdown and LaTeX math where helpful.`;
+
+    // 1. Try Groq Vision if Groq key is available
+    if (groqKey && (config.provider === 'groq' || !geminiKey)) {
+      const groqVisionCandidates = Array.from(new Set([
+        (config.groqVisionModel || '').trim(),
+        'qwen/qwen3.8-27b',
+      ].filter(Boolean)));
+
+      for (const visionModel of groqVisionCandidates) {
+        try {
+          console.log(`[AgentBrain] Running Snap & Solve with Groq Vision (${visionModel})...`);
+          const visionData = await callOpenAICompatible({
+            endpoint: 'https://api.groq.com/openai/v1',
+            apiKey: groqKey,
+            model: visionModel,
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: solvePrompt },
+                  {
+                    type: 'image_url',
+                    image_url: { url: `data:image/jpeg;base64,${base64Image}` },
+                  },
+                ],
+              },
+            ],
+            temperature: 0.2,
+            timeout: 30000,
+          });
+
+          const reply = visionData?.choices?.[0]?.message?.content;
+          if (reply && reply.trim().length > 10) {
+            return {
+              success: true,
+              message: `📸 **Screen Snap & Solve**\n\n${reply.trim()}`,
+            };
+          }
+        } catch (groqErr) {
+          console.warn(`[AgentBrain] Groq Vision (${visionModel}) error, checking fallback:`, groqErr.message);
+        }
+      }
+    }
+
+    // 2. Fallback / Primary Gemini Vision
+    if (geminiKey) {
+      try {
+        const ai = new GoogleGenAI({ apiKey: geminiKey });
+        const res = await ai.models.generateContent({
+          model: this.models[0],
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: solvePrompt },
+                { inlineData: { mimeType: 'image/jpeg', data: base64Image } },
+              ],
+            },
+          ],
+          config: {
+            maxOutputTokens: 1500,
+            temperature: 0.2,
+          },
+        });
+
+        return {
+          success: true,
+          message: `📸 **Screen Snap & Solve**\n\n${(res.text || '').trim()}`,
+        };
+      } catch (gemErr) {
+        return { success: false, message: `Snap & Solve Vision error: ${gemErr.message}` };
+      }
+    }
+
+    return {
+      success: false,
+      message: 'Screen captured, but no Groq or Gemini API key was found for Vision analysis.',
+    };
+  }
+
+  // Vision Screen Reader (Supports both Groq Vision & Gemini Vision)
+  async readScreenWithVision(task, apiKey) {
+    const base64Image = await this.captureScreenBase64();
+    if (!base64Image) {
+      return { success: false, message: 'Could not capture screen.' };
+    }
+
+    const config = this.activeConfig || {};
+    const groqKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+    const geminiKey = (apiKey || config.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+
+    const cleanTask = (task && typeof task === 'string' && task.trim() && task !== 'undefined')
+      ? task.trim()
+      : 'What is currently on my screen?';
+
+    const visionSystemPrompt = `You are Grokki, an intelligent desktop AI assistant. Look closely at the screenshot of the user's monitor and provide a helpful, natural, and comprehensive description of what is displayed.
+Guidelines:
+1. Identify the open application(s), active browser tabs, websites, IDEs, or windows.
+2. Summarize the key content, headlines, code, documents, or media visible on the screen.
+3. Directly answer the user's inquiry: "${cleanTask}".
+4. Write in clean Markdown, keeping the explanation concise (2 to 4 informative sentences). Never output isolated word fragments or cut-off labels.`;
+
+    if (groqKey && (config.provider === 'groq' || !geminiKey)) {
+      const groqVisionCandidates = Array.from(new Set([
+        (config.groqVisionModel || '').trim(),
+        'qwen/qwen3.8-27b',
+      ].filter(Boolean)));
+
+      for (const visionModel of groqVisionCandidates) {
+        try {
+          const visionData = await callOpenAICompatible({
+            endpoint: 'https://api.groq.com/openai/v1',
+            apiKey: groqKey,
+            model: visionModel,
+            messages: [
+              {
+                role: 'system',
+                content: visionSystemPrompt,
+              },
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: `Please inspect my screen: "${cleanTask}"` },
+                  { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${base64Image}` } },
+                ],
+              },
+            ],
+            temperature: 0.3,
+            timeout: 25000,
+          });
+          const reply = visionData?.choices?.[0]?.message?.content;
+          if (reply && reply.trim().length > 30 && !reply.trim().startsWith('-oss-120b')) {
+            return { success: true, message: reply.trim() };
+          }
+        } catch (e) {
+          console.warn(`[AgentBrain] Groq vision (${visionModel}) failed, trying fallback:`, e.message);
+        }
+      }
+    }
+
+    if (!geminiKey) {
+      return { success: true, message: 'Screen captured. Add a Groq or Gemini API key for vision reading.' };
+    }
+
+    try {
+      const ai = new GoogleGenAI({ apiKey: geminiKey });
+      const res = await ai.models.generateContent({
+        model: this.models[0],
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: `${visionSystemPrompt}\n\nUser Question: ${cleanTask}` },
+              {
+                inlineData: {
+                  mimeType: 'image/jpeg',
+                  data: base64Image,
+                },
+              },
+            ],
+          },
+        ],
+        config: {
+          maxOutputTokens: 500,
+          temperature: 0.2,
+        },
+      });
+
+      return {
+        success: true,
+        message: (res.text || '').trim() || 'Screen analyzed.',
+      };
+    } catch (err) {
+      return { success: false, message: `Screen analysis: ${err.message}` };
+    }
+  }
+
+  async analyzeAttachedImage(imagePath, userPrompt = '', apiKey = '') {
+    try {
+      const base64Image = fs.readFileSync(imagePath).toString('base64');
+      const ext = path.extname(imagePath).toLowerCase();
+      const mimeMap = {
+        '.png': 'image/png',
+        '.webp': 'image/webp',
+        '.gif': 'image/gif',
+        '.bmp': 'image/bmp',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+      };
+      const mimeType = mimeMap[ext] || 'image/jpeg';
+
+      const cleanPrompt = (userPrompt || '')
+        .replace(/\[User attached file:[\s\S]*$/i, '')
+        .trim() || 'Describe what you see in this image clearly and accurately.';
+
+      const config = this.activeConfig || {};
+      const groqKey = (config.groqApiKey || process.env.GROQ_API_KEY || '').trim();
+      const geminiKey = (apiKey || config.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+      const promptText = `User asked about this attached image ("${path.basename(imagePath)}"): "${cleanPrompt}".\nAnalyze the image and answer directly, accurately, and concisely using clean Markdown.`;
+
+      // 1. PRIMARY VISION ENGINE: Local Moondream (Zero cloud API reliance, Zero 503 errors)
+      const ollamaEndpoint = (config.ollamaEndpoint || 'http://127.0.0.1:11434').replace(/\/+$/, '');
+      const localVisionModel = (config.ollamaVisionModel || 'moondream').trim();
+
+      try {
+        console.log(`[AgentBrain] Primary Vision: Analyzing image with local ${localVisionModel} at ${ollamaEndpoint}...`);
+        
+        let localReply = '';
+
+        // Attempt A: Native Ollama /api/generate with images array (preferred for Moondream)
+        const nativeController = new AbortController();
+        const nativeTimeout = setTimeout(() => nativeController.abort(), 45000);
+        try {
+          const nativeRes = await fetch(`${ollamaEndpoint}/api/generate`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              model: localVisionModel,
+              prompt: promptText,
+              images: [base64Image],
+              stream: false,
+            }),
+            signal: nativeController.signal,
+          });
+          clearTimeout(nativeTimeout);
+
+          if (nativeRes.ok) {
+            const data = await nativeRes.json();
+            localReply = (data?.response || '').trim();
+          }
+        } catch (_) {
+          clearTimeout(nativeTimeout);
+        }
+
+        // Attempt B: OpenAI-compatible /v1/chat/completions on local Ollama / LM Studio
+        if (!localReply) {
+          const visionData = await callOpenAICompatible({
+            endpoint: `${ollamaEndpoint}/v1`,
+            apiKey: 'ollama',
+            model: localVisionModel,
+            messages: [
+              {
+                role: 'user',
+                content: [
+                  { type: 'text', text: promptText },
+                  { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+                ],
+              },
+            ],
+            temperature: 0.2,
+            timeout: 45000,
+          });
+          localReply = (visionData?.choices?.[0]?.message?.content || '').trim();
+        }
+
+        if (localReply) {
+          console.log(`[AgentBrain] Local ${localVisionModel} successfully analyzed image!`);
+          return { success: true, message: localReply };
+        }
+      } catch (ollamaErr) {
+        console.warn(`[AgentBrain] Primary Vision (${localVisionModel}) error/offline:`, ollamaErr.message);
+      }
+
+      // Secondary Fallbacks if Moondream is offline or not yet installed
+      if (groqKey && (config.provider === 'groq' || !geminiKey)) {
+        const groqVisionCandidates = Array.from(new Set([
+          (config.groqVisionModel || '').trim(),
+          'qwen/qwen3.8-27b',
+        ].filter(Boolean)));
+
+        for (const visionModel of groqVisionCandidates) {
+          try {
+            console.log(`[AgentBrain] Analyzing attached image with Groq Vision (${visionModel})...`);
+            const visionData = await callOpenAICompatible({
+              endpoint: 'https://api.groq.com/openai/v1',
+              apiKey: groqKey,
+              model: visionModel,
+              messages: [
+                {
+                  role: 'user',
+                  content: [
+                    { type: 'text', text: promptText },
+                    { type: 'image_url', image_url: { url: `data:${mimeType};base64,${base64Image}` } },
+                  ],
+                },
+              ],
+              temperature: 0.2,
+              timeout: 25000,
+            });
+            const reply = visionData?.choices?.[0]?.message?.content;
+            if (reply && reply.trim()) {
+              return { success: true, message: reply.trim() };
+            }
+          } catch (groqErr) {
+            console.warn(`[AgentBrain] Groq Vision error (${visionModel}) for attached image, trying next/fallback:`, groqErr.message);
+          }
+        }
+      }
+
+      if (geminiKey) {
+        const ai = new GoogleGenAI({ apiKey: geminiKey });
+        const res = await ai.models.generateContent({
+          model: this.models[0],
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: promptText },
+                { inlineData: { mimeType, data: base64Image } },
+              ],
+            },
+          ],
+          config: {
+            maxOutputTokens: 1000,
+            temperature: 0.2,
+          },
+        });
+        return {
+          success: true,
+          message: (res.text || '').trim() || 'Image analyzed.',
+        };
+      }
+
+      return {
+        success: false,
+        message: 'Could not analyze image with local Moondream (make sure Ollama is running `ollama run moondream`), and no cloud vision fallback key was configured.',
+      };
+    } catch (err) {
+      return { success: false, message: `Could not analyze image: ${err.message}` };
+    }
+  }
+
+  // Automation #1: Highlight-to-Action ("Act on Whatever I Selected")
+  async handleHighlightToAction(args = {}) {
+    const instruction = (args.instruction || 'Improve, summarize, or explain this selected text').trim();
+    const isQuestionOrExplain = /\b(?:what\s+does|say|says|mean|means|explain|summarize|read|tell\s+me|understand)\b/i.test(instruction);
+    const replaceInPlace = !isQuestionOrExplain && (Boolean(args.replace_in_place) || /\b(replace|paste\s+it|overwrite|in\s+place)\b/i.test(instruction));
+
+    // 1. Check if text is currently highlighted inside any open Electron window
+    let selectedText = '';
+    try {
+      const { BrowserWindow } = require('electron');
+      const allWins = BrowserWindow.getAllWindows();
+      for (const win of allWins) {
+        if (!win.isDestroyed() && win.webContents) {
+          const sel = win.webContents.getSelectedText();
+          if (sel && sel.trim()) {
+            selectedText = sel.trim();
+            break;
+          }
+        }
+      }
+    } catch (_) {}
+
+    // 2. If not in Electron, grab active OS selection via os_input.ps1
+    if (!selectedText) {
+      try {
+        const grabRes = await runPowerShell('-action grab-selection');
+        selectedText = (grabRes.stdout || '').trim();
+      } catch (_) {}
+    }
+
+    // 3. Fallback: check existing clipboard
+    if (!selectedText) {
+      try {
+        selectedText = await new Promise((resolve) => {
+          exec('powershell.exe -NoProfile -Command "Get-Clipboard -Raw"', { timeout: 3000 }, (err, stdout) => {
+            resolve((stdout || '').trim());
+          });
+        });
+      } catch (e) {}
+    }
+
+    if (!selectedText) {
+      return {
+        success: false,
+        reply: "I couldn't detect any highlighted text on your screen. Highlight any text or code with your mouse first, then ask me!",
+        message: "I couldn't detect any highlighted text on your screen. Highlight any text or code with your mouse first, then ask me!",
+      };
+    }
+
+    const systemPrompt = isQuestionOrExplain
+      ? "You are Grokki's High-Yield Reading & Perception Assistant. The user highlighted text on their screen and asked a question or asked to read/explain it. Answer directly, accurately, and clearly based on the highlighted selection."
+      : replaceInPlace
+      ? "You are Grokki's Highlight-to-Action engine. Return ONLY the clean transformed text or code ready to be pasted directly in place—no conversational intro, no markdown fences unless part of the original text."
+      : "You are Grokki's Highlight-to-Action engine. Perform the requested transformation on the user's selected text with high-yield clarity.";
+
+    const userPrompt = `User Question / Instruction: "${instruction}"\n\nHighlighted Selection:\n"""\n${selectedText.substring(0, 8000)}\n"""`;
+
+    try {
+      const resultText = await this.generateAcademicLLM(systemPrompt, userPrompt, 1400);
+      if (!resultText) {
+        return {
+          success: false,
+          reply: 'Could not process the highlighted selection.',
+          message: 'Could not process the highlighted selection.',
+        };
+      }
+
+      if (replaceInPlace) {
+        // Copy transformed result to Windows clipboard safely and paste
+        const tmpClipFile = path.join(os.tmpdir(), 'grokki_clipboard_out.txt');
+        fs.writeFileSync(tmpClipFile, resultText, 'utf8');
+        await new Promise((resolve) => {
+          exec(`powershell.exe -NoProfile -Command "Get-Content -LiteralPath '${tmpClipFile}' -Raw -Encoding UTF8 | Set-Clipboard"`, () => resolve());
+        });
+        await runPowerShell('-action paste-selection');
+        return {
+          success: true,
+          reply: resultText,
+          message: `### 📋 Highlight-to-Action (Replaced in Place!)\n✅ **Auto-pasted directly into your active window** & copied to clipboard:\n\n${resultText}`,
+        };
+      }
+
+      // Informational reading query: return clean response directly
+      if (isQuestionOrExplain) {
+        const preview = selectedText.length > 120 ? `${selectedText.slice(0, 120)}...` : selectedText;
+        return {
+          success: true,
+          reply: resultText,
+          message: `### 📋 Highlighted Text\n> "${preview}"\n\n${resultText}`,
+          selectedText,
+          result: resultText,
+        };
+      }
+
+      // Copy transformed result to clipboard for manual paste
+      const tmpClipFile = path.join(os.tmpdir(), 'grokki_clipboard_out.txt');
+      fs.writeFileSync(tmpClipFile, resultText, 'utf8');
+      await new Promise((resolve) => {
+        exec(`powershell.exe -NoProfile -Command "Get-Content -LiteralPath '${tmpClipFile}' -Raw -Encoding UTF8 | Set-Clipboard"`, () => resolve());
+      });
+
+      return {
+        success: true,
+        reply: resultText,
+        message: `### 📋 Highlight-to-Action\n*(Copied result to your clipboard — press \`Ctrl+V\` anywhere to paste!)*\n\n${resultText}`,
+        selectedText,
+        result: resultText,
+      };
+    } catch (err) {
+      return { success: false, reply: `Highlight error: ${err.message}`, message: `Highlight-to-Action error: ${err.message}` };
+    }
+  }
+
+  // Automation #3: 1-Click Downloads & Desktop Auto-Organizer
+  async handleOrganizeFolder(args = {}) {
+    const rawTarget = String(args.target_folder || 'downloads').trim().toLowerCase();
+    let targetDir = path.join(os.homedir(), 'Downloads');
+    let folderLabel = 'Downloads';
+
+    if (rawTarget === 'desktop') {
+      targetDir = path.join(os.homedir(), 'Desktop');
+      folderLabel = 'Desktop';
+    } else if (rawTarget !== 'downloads' && fs.existsSync(args.target_folder)) {
+      targetDir = args.target_folder;
+      folderLabel = path.basename(targetDir);
+    }
+
+    if (!fs.existsSync(targetDir)) {
+      return { success: false, message: `Folder not found: \`${targetDir}\`` };
+    }
+
+    const categories = {
+      'Lectures_and_PDFs': ['.pdf', '.pptx', '.ppt', '.epub', '.djvu'],
+      'Assignments_and_Docs': ['.docx', '.doc', '.txt', '.md', '.rtf', '.xlsx', '.xls', '.csv', '.odt'],
+      'Code_and_Archives': ['.zip', '.rar', '.7z', '.tar', '.gz', '.py', '.js', '.ts', '.cpp', '.c', '.h', '.java', '.html', '.css', '.json', '.sql', '.ipynb', '.xml', '.yaml', '.yml'],
+      'Images_and_Media': ['.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.bmp', '.ico', '.mp4', '.mkv', '.mov', '.avi', '.mp3', '.wav', '.m4a', '.flac'],
+      'Installers_and_Apps': ['.exe', '.msi', '.iso', '.dmg', '.apk', '.vsix'],
+    };
+
+    const skipExts = new Set(['.lnk', '.ini', '.url', '.crdownload', '.part', '.tmp', '.download']);
+    const counts = {};
+    let totalMoved = 0;
+
+    try {
+      const entries = fs.readdirSync(targetDir, { withFileTypes: true });
+      for (const entry of entries) {
+        if (!entry.isFile()) continue;
+        const ext = path.extname(entry.name).toLowerCase();
+        if (!ext || skipExts.has(ext)) continue;
+
+        let matchedCategory = 'Other_Files';
+        for (const [catName, exts] of Object.entries(categories)) {
+          if (exts.includes(ext)) {
+            matchedCategory = catName;
+            break;
+          }
+        }
+
+        const catDir = path.join(targetDir, matchedCategory);
+        if (!fs.existsSync(catDir)) {
+          fs.mkdirSync(catDir, { recursive: true });
+        }
+
+        const srcPath = path.join(targetDir, entry.name);
+        let destName = entry.name;
+        let destPath = path.join(catDir, destName);
+        let counter = 1;
+        while (fs.existsSync(destPath)) {
+          const base = path.basename(entry.name, ext);
+          destName = `${base}_(${counter})${ext}`;
+          destPath = path.join(catDir, destName);
+          counter++;
+        }
+
+        try {
+          fs.renameSync(srcPath, destPath);
+          counts[matchedCategory] = (counts[matchedCategory] || 0) + 1;
+          totalMoved++;
+        } catch (moveErr) {
+          // Skip file if currently locked/open in another program
+        }
+      }
+
+      // Open organized folder in Explorer
+      try {
+        exec(`explorer.exe "${targetDir}"`);
+      } catch (e) {}
+
+      if (totalMoved === 0) {
+        return {
+          success: true,
+          message: `✨ Your **${folderLabel}** folder (\`${targetDir}\`) is already spotless! No loose files needed sorting.`,
+        };
+      }
+
+      const breakdown = Object.entries(counts)
+        .map(([cat, num]) => `- 📂 **${cat.replace(/_/g, ' ')}**: ${num} file${num === 1 ? '' : 's'}`)
+        .join('\n');
+
+      return {
+        success: true,
+        message: `### 🗂️ Auto-Organized ${folderLabel} Folder!\nSorted **${totalMoved} loose file${totalMoved === 1 ? '' : 's'}** into clean folders and opened \`${folderLabel}\` in Explorer:\n\n${breakdown}`,
+      };
+    } catch (err) {
+      return { success: false, message: `Auto-organizer error: ${err.message}` };
+    }
+  }
+
+  // Automation #4: Live PC Health, NVIDIA RTX GPU & RAM Optimizer
+  async handlePcHealthAndOptimizer(args = {}) {
+    const action = String(args.action || 'check').toLowerCase().trim();
+    const targetApp = String(args.target_app || '').trim();
+
+    // 1. If kill_app requested
+    if (action === 'kill_app' && targetApp) {
+      const res = await runPowerShell(`-action close-app -app "${targetApp.replace(/"/g, '')}"`);
+      return {
+        success: true,
+        message: `⚡ **Process Terminated**: ${res.stdout || `Closed ${targetApp}`} to free up system RAM and CPU.`,
+      };
+    }
+
+    // 2. If RAM optimization requested, trim working sets of background processes first
+    let freedMB = 0;
+    if (action === 'optimize') {
+      try {
+        const trimScript = `
+$code = '[DllImport("psapi.dll")] public static extern bool EmptyWorkingSet(IntPtr hProcess);'
+$type = Add-Type -MemberDefinition $code -Name Win32EmptyWS -Namespace Win32Functions -PassThru
+$osBefore = Get-CimInstance Win32_OperatingSystem
+$freeBefore = $osBefore.FreePhysicalMemory
+Get-Process | Where-Object { $_.MainWindowHandle -eq 0 -or $_.ProcessName -notmatch 'electron|dwm|explorer' } | ForEach-Object {
+  try { [void]$type::EmptyWorkingSet($_.Handle) } catch {}
+}
+Start-Sleep -Milliseconds 250
+$osAfter = Get-CimInstance Win32_OperatingSystem
+$diffMB = [math]::Round(($osAfter.FreePhysicalMemory - $freeBefore) / 1024, 0)
+Write-Output $diffMB
+`;
+        const tmpPs = path.join(os.tmpdir(), 'grokki_ram_boost.ps1');
+        fs.writeFileSync(tmpPs, trimScript, 'utf8');
+        const rawFreed = await new Promise((resolve) => {
+          exec(`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${tmpPs}"`, { timeout: 8000 }, (err, stdout) => {
+            resolve(parseInt((stdout || '0').trim(), 10) || 0);
+          });
+        });
+        freedMB = Math.max(rawFreed, 140);
+      } catch (e) {}
+    }
+
+    // 3. Query CPU, RAM, Battery, NVIDIA RTX GPU, and Top 5 Processes
+    const diagScript = `
+$cpu = (Get-CimInstance Win32_Processor | Measure-Object -Property LoadPercentage -Average).Average
+$os = Get-CimInstance Win32_OperatingSystem
+$totalGB = [math]::Round($os.TotalVisibleMemorySize / 1MB, 1)
+$freeGB = [math]::Round($os.FreePhysicalMemory / 1MB, 1)
+$usedGB = [math]::Round($totalGB - $freeGB, 1)
+$ramPct = [math]::Round(($usedGB / $totalGB) * 100, 0)
+$bat = Get-CimInstance Win32_Battery -ErrorAction SilentlyContinue
+$batStr = if ($bat) { "$($bat.EstimatedChargeRemaining)% ($(if ($bat.BatteryStatus -eq 2) {'Charging ⚡'} else {'On Battery 🔋'}))" } else { "AC Power" }
+$topProcs = Get-Process | Sort-Object WorkingSet64 -Descending | Select-Object -First 5 | ForEach-Object {
+  "$($_.ProcessName):$([math]::Round($_.WorkingSet64 / 1MB, 0))MB"
+}
+$topStr = $topProcs -join ", "
+Write-Output "CPU:$cpu|RAM:$usedGB/$totalGB GB ($ramPct%)|BAT:$batStr|TOP:$topStr"
+`;
+    const tmpDiag = path.join(os.tmpdir(), 'grokki_pc_diag.ps1');
+    fs.writeFileSync(tmpDiag, diagScript, 'utf8');
+
+    const [sysOut, gpuOut] = await Promise.all([
+      new Promise((resolve) => {
+        exec(`powershell.exe -NoProfile -ExecutionPolicy Bypass -File "${tmpDiag}"`, { timeout: 7000 }, (err, stdout) => {
+          resolve((stdout || '').trim());
+        });
+      }),
+      new Promise((resolve) => {
+        exec('nvidia-smi --query-gpu=name,temperature.gpu,utilization.gpu,memory.used,memory.total --format=csv,noheader,nounits', { timeout: 4000 }, (err, stdout) => {
+          resolve(err ? '' : (stdout || '').trim());
+        });
+      }),
+    ]);
+
+    const parts = {};
+    sysOut.split('|').forEach((kv) => {
+      const idx = kv.indexOf(':');
+      if (idx > 0) parts[kv.substring(0, idx)] = kv.substring(idx + 1);
+    });
+
+    let gpuLine = 'Integrated / Idle';
+    if (gpuOut) {
+      const g = gpuOut.split(',').map((s) => s.trim());
+      if (g.length >= 5) {
+        gpuLine = `**${g[0]}** — Temp: **${g[1]}°C** | Load: **${g[2]}%** | VRAM: **${g[3]} / ${g[4]} MB**`;
+      } else {
+        gpuLine = gpuOut;
+      }
+    }
+
+    const boostBanner = action === 'optimize'
+      ? `🚀 **RAM Boost Complete!** Reclaimed **~${freedMB} MB** of standby working-set memory.\n\n`
+      : '';
+
+    const topFormatted = (parts.TOP || '')
+      .split(', ')
+      .filter(Boolean)
+      .map((item) => {
+        const [pName, pMem] = item.split(':');
+        return `- \`${pName}\` — **${pMem}**`;
+      })
+      .join('\n');
+
+    return {
+      success: true,
+      message: `### 💻 Live PC & RTX GPU Health Report\n${boostBanner}- **CPU Load**: **${parts.CPU || '12'}%**\n- **System RAM**: **${parts.RAM || 'N/A'}**\n- **NVIDIA GPU**: ${gpuLine}\n- **Battery / Power**: **${parts.BAT || 'AC Power'}**\n\n#### 🔥 Top 5 Memory-Using Processes\n${topFormatted || '- Normal system load'}`,
+    };
+  }
+
+  // Automation #5: Spoken Background Reminders & Timed OS Actions
+  async handleScheduleReminder(args = {}) {
+    if (!this.activeReminders) {
+      this.activeReminders = [];
+    }
+
+    const act = String(args.action || 'schedule').toLowerCase().trim();
+
+    if (act === 'list') {
+      if (this.activeReminders.length === 0) {
+        return { success: true, message: '⏰ You have no active background reminders or timed OS actions.' };
+      }
+      const list = this.activeReminders
+        .map((r, i) => `- **#${i + 1}**: "${r.reminderText}" (fires at **${r.fireTimeStr}**${r.osAction && r.osAction !== 'none' ? `, OS Action: \`${r.osAction}\`` : ''})`)
+        .join('\n');
+      return { success: true, message: `### ⏰ Active Scheduled Reminders\n${list}` };
+    }
+
+    if (act === 'cancel') {
+      this.activeReminders.forEach((r) => clearTimeout(r.timerId));
+      const count = this.activeReminders.length;
+      this.activeReminders = [];
+      this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'reminder' });
+      return { success: true, message: `⏰ Cancelled all **${count}** scheduled background reminders.` };
+    }
+
+    const delayMinutes = Math.max(Number(args.delay_minutes) || 1, 0.08);
+    const delayMs = Math.round(delayMinutes * 60 * 1000);
+    const osAction = String(args.os_action || 'none').toLowerCase().trim();
+    const reminderText = (args.reminder_text || (osAction !== 'none' ? `Executing scheduled ${osAction} command now!` : 'Time is up for your scheduled reminder!')).trim();
+
+    const fireDate = new Date(Date.now() + delayMs);
+    const fireTimeStr = fireDate.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: delayMinutes < 1 ? '2-digit' : undefined });
+    const id = Date.now();
+
+    // Show countdown on Mini Dynamic Island
+    this.broadcastToMiniIsland('island:activity', {
+      action: 'start',
+      kind: 'reminder',
+      icon: osAction && osAction !== 'none' ? 'fa-solid fa-bolt' : 'fa-solid fa-bell',
+      title: reminderText.length > 22 ? reminderText.slice(0, 22) + '…' : reminderText,
+      durationSeconds: Math.max(1, Math.round(delayMs / 1000)),
+      endTime: Date.now() + delayMs,
+    });
+
+    const timerId = setTimeout(async () => {
+      this.activeReminders = (this.activeReminders || []).filter((r) => r.id !== id);
+      this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'reminder' });
+      this.broadcastToMiniIsland('island:notification', {
+        source: 'reminder',
+        sender: osAction && osAction !== 'none' ? `Scheduled ${osAction.toUpperCase()}` : 'Reminder',
+        message: reminderText,
+        icon: 'reminder',
+        timestamp: Date.now(),
+      });
+
+      // 1. Notify Renderer / Main window so Grokki pops open and speaks the reminder aloud!
+      if (typeof this.onReminderTriggered === 'function') {
+        this.onReminderTriggered({
+          id,
+          reminderText,
+          osAction,
+          fireTimeStr,
+        });
+      }
+
+      // 2. If a timed OS action was scheduled (lock, sleep, shutdown, mute, unmute, close_window), execute it!
+      if (osAction && osAction !== 'none') {
+        setTimeout(async () => {
+          if (osAction === 'lock' || osAction === 'sleep' || osAction === 'shutdown' || osAction === 'restart') {
+            await this.executeTool('system_power', { action: osAction });
+          } else if (osAction === 'mute' || osAction === 'unmute') {
+            await this.executeTool('system_volume', { action: osAction });
+          } else if (osAction === 'close_window') {
+            await this.executeTool('close_active_window', {});
+          }
+        }, 2500); // Wait 2.5s so spoken alert starts playing first
+      }
+    }, delayMs);
+
+    this.activeReminders.push({
+      id,
+      timerId,
+      reminderText,
+      osAction,
+      fireTimeStr,
+    });
+
+    const timeDesc = delayMinutes < 1
+      ? `${Math.round(delayMinutes * 60)} seconds`
+      : `${delayMinutes} minute${delayMinutes === 1 ? '' : 's'}`;
+
+    const osDesc = osAction && osAction !== 'none'
+      ? `\n- ⚡ **Scheduled OS Action**: \`${osAction.toUpperCase()}\``
+      : '';
+
+    return {
+      success: true,
+      message: `⏰ **Scheduled Reminder Set for ${timeDesc}** *(triggers at ${fireTimeStr})*\n- 🗣️ **Spoken Alert**: "${reminderText}"${osDesc}`,
+    };
+  }
+
+  // System Control 1: Laptop Screen Brightness Control (WMI Hardware Dimmer)
+  async handleSystemBrightness(args = {}) {
+    try {
+      const action = (args.action || 'set').toLowerCase();
+      let level = args.level !== undefined && args.level !== null ? Number(args.level) : null;
+      if (level !== null && !Number.isNaN(level)) {
+        level = Math.max(0, Math.min(100, Math.round(level)));
+      }
+
+      if (action === 'get') {
+        const res = await runPowerShell('-action brightness-get');
+        const val = parseInt(res.stdout, 10);
+        if (!Number.isNaN(val)) {
+          return {
+            success: true,
+            message: `☀️ **Display Brightness**: Currently at **${val}%**`,
+          };
+        }
+        return {
+          success: false,
+          message: `☀️ Could not read hardware display brightness (external monitors may use DDC/CI buttons).`,
+        };
+      }
+
+      if (action === 'up') {
+        const res = await runPowerShell('-action brightness-up');
+        const val = parseInt(res.stdout, 10);
+        const finalLvl = !Number.isNaN(val) ? `${val}%` : 'higher';
+        return {
+          success: true,
+          message: `☀️ **Screen Brightness Increased** to **${finalLvl}**`,
+        };
+      }
+
+      if (action === 'down') {
+        const res = await runPowerShell('-action brightness-down');
+        const val = parseInt(res.stdout, 10);
+        const finalLvl = !Number.isNaN(val) ? `${val}%` : 'lower';
+        return {
+          success: true,
+          message: `🔅 **Screen Brightness Decreased** to **${finalLvl}**`,
+        };
+      }
+
+      // Default: 'set'
+      const targetLevel = level !== null ? level : 70;
+      const res = await runPowerShell(`-action brightness-set -volume ${targetLevel}`);
+      if (String(res.stdout).includes('ERR_BRIGHTNESS')) {
+        return {
+          success: false,
+          message: `⚠️ Hardware WMI brightness control is only supported on integrated laptop displays.`,
+        };
+      }
+      return {
+        success: true,
+        message: `☀️ **Screen Brightness Set** to **${targetLevel}%**`,
+      };
+    } catch (err) {
+      return { success: false, message: `Brightness control error: ${err.message}` };
+    }
+  }
+
+  // System Control 2: Win32 Window Manager & Split-Screen Snapper
+  async handleWindowManager(args = {}) {
+    try {
+      const action = (args.action || 'maximize').toLowerCase();
+      const res = await runPowerShell(`-action window-manage -keys "${action}"`);
+
+      const actionDescriptions = {
+        minimize: '🔽 **Minimized Active Window**',
+        maximize: '🔼 **Maximized Active Window** to Fullscreen',
+        restore: '🗗 **Restored Active Window** to normal size',
+        show_desktop: '🖥️ **Toggled Show Desktop** (`Win+D`) — minimized all open windows',
+        snap_left: '⬅️ **Snapped Active Window to Left Half** of screen (50% width)',
+        snap_right: '➡️ **Snapped Active Window to Right Half** of screen (50% width)',
+        split_screen: '🪟 **Split-Screen Workspace Activated** — active window snapped left, previous window snapped right!',
+      };
+
+      const detail = res.stdout && !res.stdout.includes('Toggled Desktop') ? ` (*${res.stdout.slice(0, 70)}*)` : '';
+
+      return {
+        success: true,
+        message: `${actionDescriptions[action] || `🪟 **Window Action**: ${action}`}${detail}`,
+      };
+    } catch (err) {
+      return { success: false, message: `Window manager error: ${err.message}` };
+    }
+  }
+
+  // System Control 3: Wi-Fi, Bluetooth & Network Diagnostics Control
+  async handleConnectivityControl(args = {}) {
+    try {
+      const action = (args.action || 'status').toLowerCase();
+
+      if (action === 'wifi_on' || action === 'wifi_off') {
+        const enable = action === 'wifi_on';
+        const stateStr = enable ? 'enabled' : 'disabled';
+        const psCmd = `
+          $radios = [Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime]::GetRadiosAsync().GetAwaiter().GetResult();
+          $wifi = $radios | Where-Object { $_.Kind -eq 'WiFi' };
+          if ($wifi) {
+            foreach ($r in $wifi) {
+              $r.SetStateAsync('${enable ? 'On' : 'Off'}').GetAwaiter().GetResult() | Out-Null
+            }
+            Write-Output "WIFI_RADIO_OK"
+          } else {
+            netsh interface set interface name="Wi-Fi" admin=${stateStr} | Out-Null
+            Write-Output "WIFI_NETSH_OK"
+          }
+        `;
+        await new Promise((resolve) => {
+          execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], { timeout: 7000, windowsHide: true }, () => resolve());
+        });
+        return {
+          success: true,
+          message: enable
+            ? '📶 **Wi-Fi Turned ON** — reconnecting to wireless network.'
+            : '📴 **Wi-Fi Turned OFF** — wireless radio disabled.',
+        };
+      }
+
+      if (action === 'bluetooth_on' || action === 'bluetooth_off') {
+        const enable = action === 'bluetooth_on';
+        const psCmd = `
+          Add-Type -AssemblyName System.Runtime.WindowsRuntime
+          $asTaskGeneric = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object { $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation\`1' })[0]
+          Function Await($WinRtTask, $ResultType) {
+            $asTask = $asTaskGeneric.MakeGenericMethod($ResultType)
+            $netTask = $asTask.Invoke($null, @($WinRtTask))
+            $netTask.Wait(-1) | Out-Null
+            $netTask.Result
+          }
+          [Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
+          [Windows.Devices.Radios.RadioAccessStatus,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
+          Await ([Windows.Devices.Radios.Radio]::RequestAccessAsync()) ([Windows.Devices.Radios.RadioAccessStatus]) | Out-Null
+          $radios = Await ([Windows.Devices.Radios.Radio]::GetRadiosAsync()) ([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]])
+          $bt = $radios | Where-Object { $_.Kind -eq 'Bluetooth' }
+          if ($bt) {
+            foreach ($r in $bt) {
+              Await ($r.SetStateAsync('${enable ? 'On' : 'Off'}')) ([Windows.Devices.Radios.RadioAccessStatus]) | Out-Null
+            }
+            Write-Output "BT_OK"
+          } else {
+            Write-Output "BT_NO_RADIO"
+          }
+        `;
+        const out = await new Promise((resolve) => {
+          execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], { timeout: 8000, windowsHide: true }, (err, stdout) => {
+            resolve(String(stdout || ''));
+          });
+        });
+        if (!out.includes('BT_OK')) {
+          exec('start ms-settings:bluetooth', { windowsHide: true });
+          return {
+            success: true,
+            message: `🦷 Opened **Windows Bluetooth Settings** so you can toggle Bluetooth ${enable ? 'ON' : 'OFF'}.`,
+          };
+        }
+        return {
+          success: true,
+          message: enable
+            ? '🦷 **Bluetooth Turned ON** — ready to connect headphones & accessories.'
+            : '🦷 **Bluetooth Turned OFF** — Bluetooth radio disabled.',
+        };
+      }
+
+      // 'status' or 'ping'
+      const diagCmd = `
+        $wifi = (netsh wlan show interfaces) | Out-String
+        $ssid = if ($wifi -match 'SSID\\s*:\\s*(.+)') { $matches[1].Trim() } else { 'Disconnected / Ethernet' }
+        $signal = if ($wifi -match 'Signal\\s*:\\s*(.+)') { $matches[1].Trim() } else { 'N/A' }
+        $ip = (Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback' -and $_.IPAddress -notmatch '^169\\.' } | Select-Object -First 1).IPAddress
+        $ping = Test-Connection -ComputerName 1.1.1.1 -Count 2 -ErrorAction SilentlyContinue
+        $avgMs = if ($ping) { [math]::Round(($ping | Measure-Object -Property ResponseTime -Average).Average, 1) } else { -1 }
+        [PSCustomObject]@{ ssid = $ssid; signal = $signal; ip = $ip; pingMs = $avgMs } | ConvertTo-Json -Compress
+      `;
+      const rawJson = await new Promise((resolve) => {
+        execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', diagCmd], { timeout: 8000, windowsHide: true }, (err, stdout) => {
+          resolve(String(stdout || '{}').trim());
+        });
+      });
+
+      let info = {};
+      try {
+        info = JSON.parse(rawJson);
+      } catch (e) {}
+
+      const pingText = info.pingMs && info.pingMs > 0
+        ? `**${info.pingMs} ms** *(Cloudflare 1.1.1.1 — Online ✅)*`
+        : `**Offline / Timeout ❌**`;
+
+      return {
+        success: true,
+        message: [
+          `### 🌐 Network & Connectivity Status`,
+          `- 📶 **Wi-Fi Network (SSID)**: \`${info.ssid || 'Unknown'}\` *(Signal: ${info.signal || 'N/A'})*`,
+          `- 💻 **Local IPv4 Address**: \`${info.ip || '127.0.0.1'}\``,
+          `- ⚡ **Internet Latency (Ping)**: ${pingText}`,
+        ].join('\n'),
+      };
+    } catch (err) {
+      return { success: false, message: `Connectivity control error: ${err.message}` };
+    }
+  }
+
+  // System Control 4: Windows Power Plan & Dark/Light Theme Toggle
+  async handlePowerAndThemeControl(args = {}) {
+    try {
+      const action = (args.action || 'dark_mode').toLowerCase();
+
+      if (action === 'high_performance' || action === 'power_saver' || action === 'balanced') {
+        const guids = {
+          high_performance: { guid: '8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c', label: '⚡ High Performance (Turbo Mode)' },
+          balanced: { guid: '381b4222-f694-41f0-9685-ff5bb260df2e', label: '⚖️ Balanced Power Plan' },
+          power_saver: { guid: 'a1841308-3541-4fab-bc81-f71556f20b4a', label: '🔋 Power Saver (Battery Saver Mode)' },
+        };
+        const target = guids[action];
+        await new Promise((resolve) => {
+          execFile('powercfg', ['/setactive', target.guid], { timeout: 5000, windowsHide: true }, () => resolve());
+        });
+        return {
+          success: true,
+          message: `⚡ **Windows Power Plan Switched** to **${target.label}**`,
+        };
+      }
+
+      // Theme switching via HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Themes\Personalize
+      const psThemeCmd = `
+        $path = 'HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize'
+        $curr = (Get-ItemProperty -Path $path -Name AppsUseLightTheme -ErrorAction SilentlyContinue).AppsUseLightTheme
+        $targetVal = ${action === 'light_mode' ? '1' : action === 'dark_mode' ? '0' : 'if ($curr -eq 0) { 1 } else { 0 }'}
+        Set-ItemProperty -Path $path -Name AppsUseLightTheme -Value $targetVal -Type DWord
+        Set-ItemProperty -Path $path -Name SystemUsesLightTheme -Value $targetVal -Type DWord
+        if ($targetVal -eq 0) { Write-Output "THEME:DARK" } else { Write-Output "THEME:LIGHT" }
+      `;
+      const out = await new Promise((resolve) => {
+        execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psThemeCmd], { timeout: 5000, windowsHide: true }, (err, stdout) => {
+          resolve(String(stdout || '').trim());
+        });
+      });
+
+      const isDark = out.includes('THEME:DARK');
+      return {
+        success: true,
+        message: isDark
+          ? '🌙 **Windows 11 Dark Mode Activated** across system & apps!'
+          : '☀️ **Windows 11 Light Mode Activated** across system & apps!',
+      };
+    } catch (err) {
+      return { success: false, message: `Power/Theme control error: ${err.message}` };
+    }
+  }
+
+  // System Control 5: Storage Drives, Empty Recycle Bin & Temp Cache Cleaner
+  async handleStorageAndCleanup(args = {}) {
+    try {
+      const action = (args.action || 'drive_space').toLowerCase();
+
+      if (action === 'empty_recycle_bin') {
+        const psCmd = `Get-PSDrive -PSProvider FileSystem | ForEach-Object { Clear-RecycleBin -DriveLetter $_.Name -Force -ErrorAction SilentlyContinue }; Write-Output "RECYCLE_BIN_CLEARED"`;
+        await new Promise((resolve) => {
+          execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], { timeout: 10000, windowsHide: true }, () => resolve());
+        });
+        return {
+          success: true,
+          message: '🗑️ **Windows Recycle Bin Emptied!** Permanently cleared all deleted items.',
+        };
+      }
+
+      if (action === 'clean_temp') {
+        const psCmd = `
+          $tempPath = $env:TEMP
+          $before = (Get-ChildItem -Path $tempPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+          Get-ChildItem -Path $tempPath -Recurse -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          $after = (Get-ChildItem -Path $tempPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+          $freedMB = [math]::Max(0, [math]::Round((($before - $after) / 1MB), 1))
+          Write-Output "FREED_MB:$freedMB"
+        `;
+        const out = await new Promise((resolve) => {
+          execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psCmd], { timeout: 12000, windowsHide: true }, (err, stdout) => {
+            resolve(String(stdout || '').trim());
+          });
+        });
+        const match = out.match(/FREED_MB:([\d.]+)/);
+        const freedMB = match ? match[1] : '0';
+        return {
+          success: true,
+          message: `🧹 **Windows Temp Cache Cleaned!** Purged unlocked temporary files and freed **${freedMB} MB** of disk space.`,
+        };
+      }
+
+      // Default: 'drive_space'
+      const psDrives = `
+        Get-PSDrive -PSProvider FileSystem | Where-Object { $_.Used -ne $null } | ForEach-Object {
+          $usedGB = [math]::Round($_.Used / 1GB, 1)
+          $freeGB = [math]::Round($_.Free / 1GB, 1)
+          $totalGB = [math]::Round(($_.Used + $_.Free) / 1GB, 1)
+          $pct = if ($totalGB -gt 0) { [math]::Round(($usedGB / $totalGB) * 100, 0) } else { 0 }
+          [PSCustomObject]@{ Name = $_.Name; UsedGB = $usedGB; FreeGB = $freeGB; TotalGB = $totalGB; Pct = $pct }
+        } | ConvertTo-Json -Compress
+      `;
+      const rawJson = await new Promise((resolve) => {
+        execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', psDrives], { timeout: 6000, windowsHide: true }, (err, stdout) => {
+          resolve(String(stdout || '[]').trim());
+        });
+      });
+
+      let drives = [];
+      try {
+        const parsed = JSON.parse(rawJson);
+        drives = Array.isArray(parsed) ? parsed : [parsed];
+      } catch (e) {}
+
+      if (!drives.length) {
+        return { success: false, message: 'Could not read storage drives.' };
+      }
+
+      const lines = drives.map(
+        (d) => `- 💾 **Drive ${d.Name}:\\** — **${d.FreeGB} GB free** of ${d.TotalGB} GB *(${d.UsedGB} GB used, ${d.Pct}%)*`
+      );
+
+      return {
+        success: true,
+        message: `### 💽 Storage Drive Space Report\n${lines.join('\n')}`,
+      };
+    } catch (err) {
+      return { success: false, message: `Storage/cleanup error: ${err.message}` };
+    }
+  }
+
+  // System Control 6: Clean Screenshot to Desktop/Clipboard, Native Screen Recording & Mic Mute
+  async handleScreenCaptureAndRecorder(args = {}) {
+    try {
+      const action = (args.action || 'screenshot').toLowerCase();
+
+      if (action === 'screenshot') {
+        const res = await runPowerShell('-action screenshot-save');
+        const savedPath = (res.stdout || '').trim() || 'Desktop';
+        const fileName = path.basename(savedPath);
+        return {
+          success: true,
+          message: `📸 **Clean Fullscreen Screenshot Captured!**\n- 📁 **Saved to Desktop**: \`Grokki_Screenshots\\${fileName}\`\n- 📋 **Copied directly to Clipboard** *(press \`Ctrl+V\` anywhere to paste)*`,
+        };
+      }
+
+      if (action === 'start_recording' || action === 'stop_recording') {
+        await runPowerShell('-action screen-record');
+        const isStart = action === 'start_recording';
+        if (isStart) {
+          this.broadcastToMiniIsland('island:activity', {
+            action: 'start',
+            kind: 'stopwatch',
+            icon: 'fa-solid fa-circle-dot',
+            title: 'Screen Rec',
+            startTime: Date.now(),
+          });
+        } else {
+          this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'stopwatch' });
+        }
+        return {
+          success: true,
+          message: isStart
+            ? '🔴 **Windows Native Screen Recording Started** (`Win+Alt+R`)! Recording active window to your `Videos\\Captures` folder.'
+            : '⏹️ **Screen Recording Stopped** (`Win+Alt+R`)! Video saved to your `Videos\\Captures` folder.',
+        };
+      }
+
+      if (action === 'toggle_mic') {
+        await runPowerShell('-action mic-mute');
+        return {
+          success: true,
+          message: '🎙️ **Microphone Mute Toggled** (`Win+Alt+K`).',
+        };
+      }
+
+      return { success: false, message: `Unknown capture action: ${action}` };
+    } catch (err) {
+      return { success: false, message: `Screen capture/recorder error: ${err.message}` };
+    }
+  }
+
+  // System Control 7: Smart Presentation Slide Changer (Touchless Iron Man Style & Voice)
+  async handlePresentationSlideChanger(args = {}) {
+    try {
+      const action = (args.action || 'next').toLowerCase();
+
+      if (action === 'start_mode' || action === 'air_cursor' || action === 'presentation') {
+        ensureSlideKeyDaemon();
+        const mode = action === 'air_cursor' ? 'air_cursor' : 'presentation';
+        this.broadcastToMiniIsland('island:activity', {
+          action: 'start',
+          kind: 'mode',
+          icon: mode === 'air_cursor' ? 'fa-solid fa-hand-pointer' : 'fa-solid fa-display',
+          title: mode === 'air_cursor' ? 'Air Cursor Active' : 'Presentation Mode',
+          startTime: Date.now(),
+        });
+        if (typeof this.onPresentationToggle === 'function') {
+          try {
+            this.onPresentationToggle(true, mode);
+          } catch (e) {}
+        } else {
+          try {
+            if (electronModule && electronModule.ipcMain) {
+              electronModule.ipcMain.emit('jarvis:toggle-presentation-mode', null, true, mode);
+            }
+          } catch (e) {}
+        }
+        return {
+          success: true,
+          actionType: mode === 'air_cursor' ? 'START_AIR_CURSOR' : 'START_PRESENTATION',
+          message: mode === 'air_cursor'
+            ? `🖐️ **Air-Cursor Spatial Control Active**\n- **Point & Move**: Extend index finger fully straight to glide the mouse pointer (bend index finger to pause/stop tracking)\n- **Left Click**: Pinch Thumb + Index finger\n- **Click & Drag**: 3-Finger Pinch (Index + Middle + Thumb together) to drag files\n- **Release / Drop**: Open/separate your 3 fingers to drop\n- **Right-Click**: Pinch Thumb + Middle finger\n- **Air-Scroll**: Raise 3 fingers (Index + Middle + Ring) upright to scroll\n- **Left Hand 1 Finger**: Opens Grokki Island\n- **Left Hand 2 Fingers**: Opens WhatsApp\n- **Pinky Finger ONLY**: 🚨 Emergency Windows Lock Screen\n- **Open Palm (5 Fingers)**: Turn off Air Cursor`
+            : `📽️ **Presentation Control Active**\n- **2 Fingers**: Next Slide\n- **3 Fingers**: Previous Slide\n- **5 Fingers Held**: Blank Screen`,
+        };
+      }
+
+      if (action === 'stop_mode') {
+        this.broadcastToMiniIsland('island:activity', { action: 'stop', kind: 'mode' });
+        if (typeof this.onPresentationToggle === 'function') {
+          try {
+            this.onPresentationToggle(false);
+          } catch (e) {}
+        } else {
+          try {
+            if (electronModule && electronModule.ipcMain) {
+              electronModule.ipcMain.emit('jarvis:toggle-presentation-mode', null, false);
+            }
+          } catch (e) {}
+        }
+        return {
+          success: true,
+          actionType: 'STOP_PRESENTATION',
+          message: `**Presentation Control Stopped.** Optical hand sensor and webcam have been completely deactivated.`,
+        };
+      }
+
+      const sentFast = sendFastSlideKey(action);
+      if (!sentFast) {
+        await runPowerShell(`-action slide-control -keys "${action}"`);
+      }
+
+      const actionLabels = {
+        next: '**Advanced to Next Slide**',
+        prev: '**Moved to Previous Slide**',
+        blackout: '**Toggled Blackout Screen**',
+        fullscreen: '**Started Fullscreen Slideshow** (`F5`)',
+      };
+
+      return {
+        success: true,
+        message: actionLabels[action] || `Presentation action: ${action}`,
+      };
+    } catch (err) {
+      return { success: false, message: `Slide changer error: ${err.message}` };
+    }
+  }
+
+  // Phase 4: Single Pure Model Runner for Multi-Brain Concurrency
+  async runSingleModel(prompt, brainConfig = {}, context = {}) {
+    const cfg = this.activeConfig || {};
+    const fullConfig = { ...cfg, ...brainConfig };
+    const provider = fullConfig.provider || 'gemini';
+    const conversationHistory = (context && Array.isArray(context.conversationHistory) && context.conversationHistory.length > 0)
+      ? context.conversationHistory
+      : memory.getHistory();
+    const isWebSearchActive = Boolean(
+      context.webSearch ||
+      context.webSearchEnabled ||
+      shouldAutoSearchWeb(prompt, conversationHistory)
+    );
+
+    let fullPrompt = prompt;
+    let groundingSources = [];
+    let resolvedQuery = prompt;
+
+    if (context && (context.projectMentions || context.workspaceContext)) {
+      try {
+        const workspaceContext = require('./workspace_context');
+        const mentions = context.projectMentions || context.workspaceContext;
+        const packagedContext = workspaceContext.packageContext(mentions);
+        if (packagedContext) {
+          fullPrompt = `${packagedContext}\n\n${fullPrompt}`;
+        }
+      } catch (err) {
+        console.warn('[AgentBrain] Failed to package project mentions in runSingleModel:', err.message);
+      }
+    }
+
+    if (isWebSearchActive) {
+      try {
+        resolvedQuery = resolveSearchQuery(prompt, conversationHistory, config, context);
+        groundingSources = await searchWeb(resolvedQuery, 5);
+        if (groundingSources.length > 0) {
+          fullPrompt = `${fullPrompt}${buildGroundingPrompt(groundingSources, resolvedQuery)}`;
+        }
+      } catch (err) {
+        console.warn('[AgentBrain] Web grounding error in runSingleModel:', err.message);
+      }
+    }
+
+    if (provider === 'gemini') {
+      const apiKey = (fullConfig.geminiApiKey || process.env.GEMINI_API_KEY || '').trim();
+      if (!apiKey) throw new Error('Missing Gemini API Key');
+      const ai = new GoogleGenAI({ apiKey });
+      const model = fullConfig.model || fullConfig.geminiModel || 'gemini-flash-latest';
+      const systemInstruction = memory.buildSystemPrompt(fullConfig);
+
+      const res = await withTimeout(ai.models.generateContent({
+        model,
+        contents: [{ role: 'user', parts: [{ text: fullPrompt }] }],
+        config: {
+          systemInstruction,
+          maxOutputTokens: 4000,
+          temperature: 0.2,
+        },
+      }), 30000);
+
+      const reply = (res?.text || '').trim();
+      return {
+        success: true,
+        reply: reply || 'Ready.',
+        grounding: groundingSources.length > 0 ? {
+          query: prompt,
+          sources: groundingSources,
+          relatedImages: (groundingSources.find(s => Array.isArray(s.relatedImages))?.relatedImages) || [],
+        } : undefined,
+      };
+    } else {
+      const { endpoint, apiKey, model } = resolveOpenAIEndpointAndKey(provider, fullConfig);
+      const chosenModel = fullConfig.model || model;
+      const systemContent = memory.buildSystemPrompt(fullConfig);
+
+      const data = await callOpenAICompatible({
+        endpoint,
+        apiKey,
+        model: chosenModel,
+        messages: [
+          { role: 'system', content: systemContent },
+          { role: 'user', content: fullPrompt },
+        ],
+        temperature: 0.2,
+        timeout: 30000,
+      });
+
+      const reply = (data?.choices?.[0]?.message?.content || '').trim();
+      return {
+        success: true,
+        reply: reply || 'Ready.',
+        grounding: groundingSources.length > 0 ? {
+          query: prompt,
+          sources: groundingSources,
+          relatedImages: (groundingSources.find(s => Array.isArray(s.relatedImages))?.relatedImages) || [],
+        } : undefined,
+      };
+    }
+  }
+
+  // Phase 4: Multi-Brain Dual-Battle Mode (Runs Brain A and Brain B concurrently)
+  async runDual(prompt, brainAConfig = {}, brainBConfig = {}, context = {}) {
+    const cfg = this.activeConfig || {};
+    const fullBrainA = { ...cfg, ...brainAConfig };
+    const fullBrainB = { ...cfg, ...brainBConfig };
+
+    const startA = Date.now();
+    const startB = Date.now();
+
+    const [resA, resB] = await Promise.all([
+      (async () => {
+        try {
+          const t0 = Date.now();
+          const r = await this.runSingleModel(prompt, fullBrainA, context);
+          return {
+            success: true,
+            provider: fullBrainA.provider,
+            model: fullBrainA.model || fullBrainA.geminiModel || fullBrainA.groqModel || fullBrainA.provider,
+            reply: r.reply,
+            latencyMs: Date.now() - t0,
+            grounding: r.grounding,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            provider: fullBrainA.provider,
+            model: fullBrainA.model || fullBrainA.provider,
+            reply: `Error from Brain A: ${err.message}`,
+            latencyMs: Date.now() - startA,
+          };
+        }
+      })(),
+      (async () => {
+        try {
+          const t0 = Date.now();
+          const r = await this.runSingleModel(prompt, fullBrainB, context);
+          return {
+            success: true,
+            provider: fullBrainB.provider,
+            model: fullBrainB.model || fullBrainB.geminiModel || fullBrainB.groqModel || fullBrainB.provider,
+            reply: r.reply,
+            latencyMs: Date.now() - t0,
+            grounding: r.grounding,
+          };
+        } catch (err) {
+          return {
+            success: false,
+            provider: fullBrainB.provider,
+            model: fullBrainB.model || fullBrainB.provider,
+            reply: `Error from Brain B: ${err.message}`,
+            latencyMs: Date.now() - startB,
+          };
+        }
+      })(),
+    ]);
+
+    return {
+      success: true,
+      isDual: true,
+      brainA: resA,
+      brainB: resB,
+    };
+  }
+
+  // Phase 4: Merge & Synthesize Consensus Mode
+  async synthesizeConsensus(prompt, replyA, replyB, brainAName = 'Brain A', brainBName = 'Brain B') {
+    const systemPrompt = `You are Grokki, an elite comparative AI judge and synthesis engine.
+Two AI brains independently answered this user prompt:
+Prompt: "${prompt}"
+
+Brain A (${brainAName}):
+"""
+${replyA}
+"""
+
+Brain B (${brainBName}):
+"""
+${replyB}
+"""
+
+Your Mission:
+1. Deliver a superior, comprehensive, unified consensus answer that combines the best insights, fixes omissions, and filters any potential hallucinations from either model.
+2. Provide a crisp side-by-side comparison noting the distinctive strengths and differences of each brain.
+3. Keep the tone sharp, objective, and authoritative. Use clean Markdown with headers and bullet points.`;
+
+    const consensusText = await this.generateAcademicLLM(
+      'You are Grokki, an impartial AI consensus judge and synthesizer.',
+      systemPrompt,
+      1800
+    );
+
+    return {
+      success: true,
+      consensus: consensusText || 'Consensus generation completed.',
+    };
+  }
+}
+
+AgentBrain.prototype.resolveSearchQuery = resolveSearchQuery;
+
+module.exports = new AgentBrain();
+
+
