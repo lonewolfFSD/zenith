@@ -4832,7 +4832,7 @@ ipcMain.handle('app:get-version', () => {
 ipcMain.handle('app:check-for-updates', async () => {
   try {
     const currentVersion = app.getVersion();
-    const officialRepo = 'lonewolfFSD/grokki-studio';
+    const officialRepo = 'lonewolfFSD/zenith';
     const releasesWebUrl = `https://github.com/${officialRepo}/releases`;
 
     let latestRelease = null;
@@ -4842,7 +4842,7 @@ ipcMain.handle('app:check-for-updates', async () => {
       const res = await fetch(`https://api.github.com/repos/${officialRepo}/releases/latest`, {
         signal: AbortSignal.timeout(3500),
         headers: {
-          'User-Agent': 'Grokki-Studio-Desktop',
+          'User-Agent': 'Zenith-Desktop',
           'Accept': 'application/vnd.github.v3+json',
         },
       });
@@ -4857,7 +4857,7 @@ ipcMain.handle('app:check-for-updates', async () => {
         const res = await fetch(`https://api.github.com/repos/${officialRepo}/releases`, {
           signal: AbortSignal.timeout(3500),
           headers: {
-            'User-Agent': 'Grokki-Studio-Desktop',
+            'User-Agent': 'Zenith-Desktop',
             'Accept': 'application/vnd.github.v3+json',
           },
         });
@@ -4899,7 +4899,7 @@ ipcMain.handle('app:check-for-updates', async () => {
       a.name.endsWith('.exe') || a.name.endsWith('.msi')
     ) || latestRelease.assets?.[0];
 
-    const targetFileName = asset?.name || `Grokki.Studio-Setup-${latestTag.replace(/^v/, '')}.exe`;
+    const targetFileName = asset?.name || `Zenith-Setup-${latestTag.replace(/^v/, '')}.exe`;
     const tempDir = app.getPath('temp');
     const localInstallerPath = path.join(tempDir, targetFileName);
 
@@ -4940,7 +4940,7 @@ ipcMain.handle('app:check-for-updates', async () => {
 
 ipcMain.handle('app:download-update', async (event, { assetId, fileName, assetSize, downloadUrl }) => {
   try {
-    const targetFileName = fileName || 'Grokki.Studio-Setup-Update.exe';
+    const targetFileName = fileName || 'Zenith-Setup-Update.exe';
     const tempDir = app.getPath('temp');
     const localInstallerPath = path.join(tempDir, targetFileName);
 
@@ -4953,14 +4953,14 @@ ipcMain.handle('app:download-update', async (event, { assetId, fileName, assetSi
     }
 
     const targetUrl = assetId
-      ? `https://api.github.com/repos/lonewolfFSD/grokki-studio/releases/assets/${assetId}`
+      ? `https://api.github.com/repos/lonewolfFSD/zenith/releases/assets/${assetId}`
       : downloadUrl;
 
     console.log('[Main] Downloading update installer from:', targetUrl, 'to:', localInstallerPath);
 
     const res = await fetch(targetUrl, {
       headers: {
-        'User-Agent': 'Grokki-Studio-Desktop',
+        'User-Agent': 'Zenith-Desktop',
         'Accept': 'application/octet-stream',
       },
     });
@@ -5010,7 +5010,7 @@ ipcMain.handle('app:download-update', async (event, { assetId, fileName, assetSi
 
 ipcMain.on('app:restart-and-install', (event, data) => {
   try {
-    console.log('[Main] Restarting Grokki Studio to apply update...', data);
+    console.log('[Main] Restarting Zenith to apply update...', data);
     const installerPath = data?.downloadedPath;
     if (installerPath && fs.existsSync(installerPath)) {
       console.log('[Main] Launching update installer executable:', installerPath);

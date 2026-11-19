@@ -3,16 +3,54 @@
     "version":  "1.0.0",
     "description":  "Zenith · Top Notch & Dynamic Control Centre for Windows",
     "main":  "src/main/main.js",
-    "scripts":  {
-                    "dev":  "electron .",
-                    "build":  "vite build",
-                    "start":  "electron .",
-                    "test:desktop":  "electron scripts/test_agent_desktop.js",
-                    "pack":  "npm run build \u0026\u0026 electron-builder --dir",
-                    "dist":  "npm run build \u0026\u0026 electron-builder --win nsis",
-                    "release":  "npm run build \u0026\u0026 electron-builder --win nsis --publish always",
-                    "dist:appx":  "npm run build \u0026\u0026 electron-builder --win appx"
-                },
+    "scripts": {
+        "dev": "electron .",
+        "start": "electron .",
+        "test:desktop": "electron scripts/test_agent_desktop.js",
+        "pack": "electron-builder --dir",
+        "dist": "electron-builder --win nsis",
+        "release": "electron-builder --win nsis --publish always"
+    },
+    "build": {
+        "appId": "com.zenith.notch",
+        "productName": "Zenith",
+        "copyright": "Copyright © 2026 lonewolfFSD",
+        "directories": {
+            "output": "dist"
+        },
+        "files": [
+            "src/**/*",
+            "assets/**/*",
+            "package.json"
+        ],
+        "asarUnpack": [
+            "src/main/*.ps1",
+            "src/main/*.py",
+            "src/main/*.task",
+            "assets/**"
+        ],
+        "win": {
+            "target": [
+                {
+                    "target": "nsis",
+                    "arch": [
+                        "x64"
+                    ]
+                }
+            ],
+            "icon": "assets/icon.ico"
+        },
+        "nsis": {
+            "oneClick": false,
+            "allowToChangeInstallationDirectory": true,
+            "createDesktopShortcut": true,
+            "createStartMenuShortcut": true,
+            "shortcutName": "Zenith",
+            "installerIcon": "assets/icon.ico",
+            "uninstallerIcon": "assets/icon.ico",
+            "artifactName": "${productName}-Setup-${version}.${ext}"
+        }
+    },
     "publish":  {
                     "provider":  "github",
                     "owner":  "lonewolfFSD",
